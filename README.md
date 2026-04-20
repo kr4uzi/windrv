@@ -34,6 +34,11 @@ Note: The database will store relative or absolute paths depending on how the in
 # Adding Builtin Drivers from WIMs
 `/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --class-filter=Net boot.wim`
 
+# Add and copy drivers from a directory
+`/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --store=AMD2026 /path/to/amd/drivers/driver.inf`
+
+This will parse the driver.inf file but also copy driver files to the windrv/store/AMD2026 directory, allowing to store only the absolute minimum files required.
+
 # TODOs
 - Implement support for "LayoutFile" (apparently only for the Version section and apparently only for Win2000 and WinXP)
 - Add support for DOS kernel handling (Win98)

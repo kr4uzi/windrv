@@ -1,5 +1,6 @@
 #!/srv/windrv/.venv/bin/python
 import os
+import shutil
 import codecs
 from unittest.mock import patch, mock_open
 import subprocess
@@ -551,6 +552,11 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--store",
+        help="copy driver files to the given folder"
+    )
+
+    parser.add_argument(
         "--class-filter",
         help="only add drivers for the given class (e.g. Net, Display, Bluetooth)",
         nargs="+"
@@ -608,7 +614,12 @@ if __name__ == "__main__":
                     continue
 
                 print("processing: " + file)
-                drvid = db.addDriver(drvid, str(driver.rootPath), str(driver.infPath), container)
+                rootPath = str(driver.rootPath)
+                if args.store and not wim:
+                    rootPath = os.path.join('store', args.store)
+                    os.makedirs(rootPath, exist_ok=True)
+
+                drvid = db.addDriver(drvid, rootPath, str(driver.infPath), container)
                 for d in driver.targets:
                     tid = db.addTarget(drvid, str(d.root), d.HardwareID, d.DeviceDescription, d.Architecture, d.OSMajorVersion, d.OSMinorVersion, d.BuildNumber, d.date, d.version)
                     if not wim:
@@ -619,3 +630,5 @@ if __name__ == "__main__":
                         # parsing strategy)
                         for fpath in d.files:
                             db.addFile(tid, str(fpath))
+                            if args.store:
+                                shutil.copy(driver.rootPath.joinpath(fpath), os.path.join('store', args.store, fpath))
