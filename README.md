@@ -11,15 +11,20 @@ A driver can be tagged with a container which is done automatically when process
 
 
 # Setup
+`cd /srv && git clone https://github.com/kr4uzi/windrv`
+
+If you didn't install to /srv/windrv please adjust the first line of windrvscan.py!
+
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install packaging wininfparser
 chmod +x windrvscan.py
-```
 
-If you didn't install to /srv/windrv please adjust the first line of windrvscan.py!
+# make windrv available for pxe
+ln -s /srv/windrv /var/www/html/windrv
+```
 
 Note: The database will store relative or absolute paths depending on how the inf file was provided.
 
@@ -37,7 +42,7 @@ Note: The database will store relative or absolute paths depending on how the in
 
 # References
 ## About model section parsing:
-https://learn.microsoft.com/windows-hardware/drivers/install/creating-inf-files-for-multiple-platforms-and-operating-systems
+https://learn.microsoft.com/windows-hardware/drivers/install/creating-inf-files-for-multiple-platforms-and-operating-systems\
 On Windows Server 2003 Service Pack 1 (SP1) and later, INF files must decorate entries 
 in the INF Models section with .ntia64, .ntarm, .ntarm64 or .ntamd64 platform extensions 
 to specify non-x86 target operating system versions.
