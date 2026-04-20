@@ -11,7 +11,10 @@ A driver can be tagged with a container which is done automatically when process
 
 
 # Setup
-`cd /srv && git clone https://github.com/kr4uzi/windrv`
+```sh
+apt install wimtools
+cd /srv && git clone https://github.com/kr4uzi/windrv
+```
 
 If you didn't install to /srv/windrv please adjust the first line of windrvscan.py!
 

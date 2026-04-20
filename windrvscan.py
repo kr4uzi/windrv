@@ -13,6 +13,7 @@ from datetime import datetime
 
 class DriverTarget:
     HardwareID: str
+    DeviceDescription: str
     date: datetime.date
     version: pkgver.Version | None
     Architecture: str
@@ -24,8 +25,9 @@ class DriverTarget:
     root: pathlib.Path
     files: list[pathlib.Path]
 
-    def __init__(self, hardwareID: str, date: datetime.date, version: pkgver.Version | None, files: list[pathlib.Path]):
+    def __init__(self, hardwareID: str, deviceDescription: str, date: datetime.date, version: pkgver.Version | None, files: list[pathlib.Path]):
         self.HardwareID = hardwareID
+        self.DeviceDescription = deviceDescription
         self.date = date
         self.version = version
         self.Architecture = self.OSMajorVersion = self.OSMinorVersion = self.ProductType = self.SuiteMask = self.BuildNumber = None
@@ -55,6 +57,8 @@ class DriverFile:
     sourceDiskNames: dict[tuple[str, str], pathlib.Path]
     # tuple(arch, filename)
     sourceDiskFiles: dict[tuple[str, str], pathlib.Path]
+    # key to value mapping for string replacement (e.g. %strkey% in the model section)
+    strings: dict[str, str]
 
     def __init__(self, path: str, wim=None):
         self.valid = False
@@ -66,6 +70,7 @@ class DriverFile:
         self.sectionFiles = {}
         self.sourceDiskNames = {}
         self.sourceDiskFiles = {}
+        self.strings = {}
         self.targets = []
 
         self.inf = wininfparser.WinINF()
@@ -113,6 +118,7 @@ class DriverFile:
 
     def parseDevices(self):
         self._parseSourceFiles()
+        self._parseStrings()
         self._parseManufacturer()
 
         if len(self.targets):
@@ -193,6 +199,13 @@ class DriverFile:
                     self.sourceDiskFiles[(arch, filename)] = basepath.joinpath(subdir)
                 else:
                     self.sourceDiskFiles[(arch, filename)] = basepath
+
+
+    def _parseStrings(self):
+        if not "strings" in self.sections: return
+
+        for key, value, _ in self.sections["strings"]:
+            self.strings[key] = value.strip('"').strip("'")
 
 
     def _getSectionFiles(self, name: str, stack: set = set()):
@@ -325,7 +338,14 @@ class DriverFile:
             elif '' in self.catalogs:
                 mappedfiles = mappedfiles.union(self.catalogs[''])
 
-            device = DriverTarget(hardwareId, self.date, self.version, list(mappedfiles))
+            name = deviceDescription
+            if deviceDescription.startswith('%') and deviceDescription.endswith('%'):
+                if deviceDescription[1:-1] in self.strings:
+                    name = self.strings[deviceDescription[1:-1]]
+                else:
+                    print(f"warning: device description {deviceDescription} not found in strings")
+            
+            device = DriverTarget(hardwareId, name, self.date, self.version, list(mappedfiles))
             device.Architecture = arch
             device.OSMajorVersion = int(osma) if osma else None
             device.OSMinorVersion = int(osmi) if osmi else None
@@ -444,6 +464,7 @@ class DriverDatabase:
                     driver INTEGER NOT NULL,
                     root TEXT NOT NULL,
                     hwid TEXT NOT NULL,
+                    name TEXT NOT NULL,
                     arch TEXT,
                     os_major INTEGER,
                     os_minor INTEGER,
@@ -489,15 +510,15 @@ class DriverDatabase:
                 "DELETE FROM driver WHERE root = ? AND inf = ? AND container = ? RETURNING id",
                 (root, inf, container)
             )
-            res = cursor.fetchone()
-            if res: return res[0]
+            res = cursor.fetchall()
+            if res: return res[0][0]
 
-    def addTarget(self, driver, root, hwid, arch, os_major, os_minor, os_build, date: datetime, version: pkgver.Version) -> int:
+    def addTarget(self, driver, root, hwid, name, arch, os_major, os_minor, os_build, date: datetime, version: pkgver.Version) -> int:
         with self.conn:
             cursor = self.conn.execute("""
-                INSERT INTO target (driver, root, hwid, arch, os_major, os_minor, os_build, date, v_major, v_minor, v_patch, v_build)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
-                (driver, root, hwid, arch, os_major, os_minor, os_build, date.timestamp(), version.major, version.minor, version.micro, version.release[-1]))
+                INSERT INTO target (driver, root, hwid, name, arch, os_major, os_minor, os_build, date, v_major, v_minor, v_patch, v_build)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
+                (driver, root, hwid, name, arch, os_major, os_minor, os_build, date.timestamp(), version.major, version.minor, version.micro, version.release[-1]))
             return cursor.lastrowid
 
     def addFile(self, target: int, path: str) -> int:
@@ -573,13 +594,15 @@ if __name__ == "__main__":
 
             for file in files:
                 driver = DriverFile(file, wim=wim)
-                drvid = db.removeDriver(str(driver.rootPath), str(driver.infPath), container if container else "")
                 if not driver.valid: continue
 
                 if args.class_filter and driver.klass not in args.class_filter:
                     continue
 
                 driver.parseDevices()
+
+                # only now the infPath and rootPath are now accurate
+                drvid = db.removeDriver(str(driver.rootPath), str(driver.infPath), container if container else "")
                 if len(driver.targets) == 0:
                     print(file + " - no hardware ids contained - ignoring")
                     continue
@@ -587,7 +610,7 @@ if __name__ == "__main__":
                 print("processing: " + file)
                 drvid = db.addDriver(drvid, str(driver.rootPath), str(driver.infPath), container)
                 for d in driver.targets:
-                    tid = db.addTarget(drvid, str(d.root), d.HardwareID, d.Architecture, d.OSMajorVersion, d.OSMinorVersion, d.BuildNumber, d.date, d.version)
+                    tid = db.addTarget(drvid, str(d.root), d.HardwareID, d.DeviceDescription, d.Architecture, d.OSMajorVersion, d.OSMinorVersion, d.BuildNumber, d.date, d.version)
                     if not wim:
                         # we do not store built-in drivers as the use-case for wim-parsing
                         # is to check if driver for a device is built-in and not

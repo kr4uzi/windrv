@@ -35,6 +35,7 @@ $total_pages = ceil($total_results / $per_page);
 // Build main query with pagination
 $sql = "SELECT
     target.id,
+    target.name,
     target.hwid,
     target.v_major,
     target.v_minor,
@@ -243,6 +244,7 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
             <table>
                 <thead>
                     <tr>
+                        <th>Name</th>
                         <th>Hardware ID</th>
                         <th>Windows</th>
                         <th>Version</th>
@@ -252,6 +254,9 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 </thead>
                 <tbody>
                     <tr class="filter-row">
+                        <td>
+                            <input type="text" disabled placeholder="Filter disabled">
+                        </td>
                         <td>
                             <input type="text" name="hwid" value="<?php echo htmlspecialchars($hwid_search); ?>" placeholder="Search Hardware ID...">
                         </td>
@@ -273,13 +278,16 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     </tr>
                     <?php if (empty($results)): ?>
                         <tr>
-                            <td colspan="5" style="text-align: center; padding: 40px; color: #999;">
+                            <td colspan="6" style="text-align: center; padding: 40px; color: #999;">
                                 No drivers found. <?php echo !empty($hwid_search) ? 'Try a different search term.' : 'Database is empty.'; ?>
                             </td>
                         </tr>
                     <?php else: ?>
                         <?php foreach ($results as $row): ?>
                             <tr>
+                                <td>
+                                    <?php echo htmlspecialchars($row['name'] ?? ''); ?>
+                                </td>
                                 <td>
                                     <span class="code"><?php echo htmlspecialchars($row['hwid']); ?></span>
                                 </td>

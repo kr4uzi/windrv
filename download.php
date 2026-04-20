@@ -25,7 +25,7 @@ if (!$driver) {
     die("target unknown");
 }
 
-$root = $driver['driver_root'] . DIRECTORY_SEPARATOR . $driver['target_root'];    
+$root = $driver['driver_root'] . DIRECTORY_SEPARATOR . $driver['target_root'];
 $stmt = $db->prepare(<<<SQL
     SELECT `path`
     FROM `file`
@@ -35,8 +35,8 @@ $stmt->execute([$driver['target_id']]);
 $files = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $paths = array();
 foreach ($files as $file) {
-    $file_path = $root . DIRECTORY_SEPARATOR . $file['path'];
-    if (file_exists($file_path)) {
+    $file_path = realpath($root . DIRECTORY_SEPARATOR . $file['path']);
+    if ($file_path && file_exists($file_path)) {
         $paths[] = $file['path'];
     }
 }
