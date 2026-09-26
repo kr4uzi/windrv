@@ -1,32 +1,30 @@
 #!/srv/windrv/.venv/bin/python
 import os
 import shutil
-import codecs
-from unittest.mock import patch, mock_open
 import subprocess
 import argparse
 import pathlib
-import wininfparser
+import infparser
 import sqlite3
 from packaging import version as pkgver
-from datetime import datetime
+from datetime import date, datetime
 
 
 class DriverTarget:
     HardwareID: str
     DeviceDescription: str
-    date: datetime.date
+    date: date | None
     version: pkgver.Version | None
-    Architecture: str
+    Architecture: str | None
     OSMajorVersion: int | None
     OSMinorVersion: int | None
     ProductType: str | None
     SuiteMask: str | None
     BuildNumber: int | None
     root: pathlib.Path
-    files: list[pathlib.Path]
+    files: set[pathlib.Path]
 
-    def __init__(self, hardwareID: str, deviceDescription: str, date: datetime.date, version: pkgver.Version | None, files: list[pathlib.Path]):
+    def __init__(self, hardwareID: str, deviceDescription: str, date: date | None, version: pkgver.Version | None, files: list[pathlib.Path]):
         self.HardwareID = hardwareID
         self.DeviceDescription = deviceDescription
         self.date = date
@@ -48,10 +46,10 @@ class DriverFile:
     infPath: pathlib.Path
     rootPath: pathlib.Path
     version: pkgver.Version
-    date: datetime.date
+    date: date | None
     targets: list[DriverTarget]
-    inf: wininfparser.WinINF
-    sections: dict[str, list[tuple[str, str, str]]]
+    inf: infparser.InfFile
+    sections: dict[str, list[tuple[str, str, infparser.Entry]]]
     catalogs: dict[str, set[pathlib.Path]]
     sectionFiles: dict[str, set[str]]
     # tuple(arch, diskid)
@@ -61,7 +59,7 @@ class DriverFile:
     # key to value mapping for string replacement (e.g. %strkey% in the model section)
     strings: dict[str, str]
 
-    def __init__(self, path: str, wim=None):
+    def __init__(self, path: str, wim: tuple[str, int] | None = None):
         self.valid = False
         self.klass = ""
         self.infPath = pathlib.Path(path)
@@ -74,40 +72,30 @@ class DriverFile:
         self.strings = {}
         self.targets = []
 
-        self.inf = wininfparser.WinINF()
         if wim:
             data = subprocess.run(["wimextract", wim[0], str(wim[1]), path, "--to-stdout"], capture_output=True).stdout
-            # https://learn.microsoft.com/en-us/windows-hardware/drivers/display/general-unicode-requirement
-            # INF files must be saved with Unicode (UTF-16 LE) or ANSI file encoding
-            if data.startswith(codecs.BOM_UTF16_LE):
-                data = data.decode("utf-16")
-            else:
-                data = data.decode('cp1252')
-
-            with patch("builtins.open", mock_open(read_data=data)) as mocked_file:
-                self.inf.ParseFile(path)
-                #mocked_file.assert_called_once_with(path)
+            self.inf = infparser.InfFile.load(data, name=path)
         else:
-            self.inf.ParseFile(path)
+            self.inf = infparser.InfFile.load(path)
 
-        for name in self.inf.Sections():
-            # Section names, entries, and directives are case-insensitive.
-            # For example, version, VERSION, and Version are equally valid
-            # section name specifications within an INF file.
-            normalized = name.lower()
-            if normalized not in self.sections:
-                self.sections[normalized] = []
-            elif normalized == "version" and normalized in self.sections:
-                print("warning: more than one version section found")
+        for warning in self.inf.warnings:
+            print("warning: " + warning)
 
-            for key, value, comment in self.inf.GetSection(name):
-                key = key.strip()
-                value = value.strip()
+        # section names and keys are case-insensitive (the parser already
+        # merged duplicate sections); lines without a key (file lists,
+        # manufacturer names) keep their comma separated values as key
+        for normalized, section in self.inf.sections.items():
+            self.sections[normalized] = []
+            for entry in section.entries:
+                if entry.rawKey is not None:
+                    key, value = entry.rawKey, ','.join(entry.rawValues)
+                else:
+                    key, value = ','.join(entry.rawValues), ''
 
                 if not key and not value: continue
                 # we normalize the key, but not the value which is normalized
                 # within the used context
-                self.sections[normalized].append((key.lower(), value, comment))
+                self.sections[normalized].append((key.lower(), value, entry))
 
         if not "version" in self.sections:
             print("error: no version section found")
@@ -144,7 +132,7 @@ class DriverFile:
                 # diskid = disk-description[,[tag-or-cab-file][,[unused][,path]]] |
                 # diskid = disk-description[,[tag-or-cab-file],[unused],[path][,flags]] |
                 # diskid = disk-description[,[tag-or-cab-file],[unused],[path],[flags][,tag-file]]  (Windows XP and later versions of Windows)
-                (desc, tagOrCabFile, _, path, flags, tagFile) = value + [None] * (6 - len(value))
+                (desc, tagOrCabFile, _, path, flags, tagFile) = value + [''] * (6 - len(value))
 
                 if (arch, diskid) in self.sourceDiskNames:
                     print(f"warning: diskid {diskid} defined path multiple times (section: {section})")
@@ -159,18 +147,21 @@ class DriverFile:
                     self.sourceDiskNames[(arch, diskid)] = self.rootPath
 
                 if tagOrCabFile:
+                    tagPath = self.sourceDiskNames[(arch, diskid)].joinpath(tagOrCabFile)
                     if not arch in self.catalogs: self.catalogs[arch] = set()
-                    if tagOrCabFile in self.catalogs[arch]:
+                    if tagPath in self.catalogs[arch]:
                         print(f"warning: tag-or-cab-file {tagOrCabFile} appeared multiple times (section: {section})")
                     else:
-                        self.catalogs[arch].add(self.sourceDiskNames[(arch, diskid)].joinpath(tagOrCabFile))
+                        self.catalogs[arch].add(tagPath)
 
                 if tagFile:
+                    tagPath = self.sourceDiskNames[(arch, diskid)].joinpath(tagFile)
+
                     if not arch in self.catalogs: self.catalogs[arch] = set()
-                    if tagFile in self.sourceDiskCatalogs[(arch, diskid)]:
+                    if tagPath in self.catalogs[arch]:
                         print(f"warning: tag-file {tagFile} appeared multiple times (section: {section})")
                     else:
-                        self.catalogs[arch].add(self.sourceDiskNames[(arch, diskid)].joinpath(tagFile))
+                        self.catalogs[arch].add(tagPath)
 
         for section in self.sections:
             if not section.startswith("sourcedisksfiles"):
@@ -183,7 +174,7 @@ class DriverFile:
 
                 value = value.split(',')
                 # filename=diskid[,[ subdir][,size]]
-                (diskid, subdir, size) = value + [None] * (3 - len(value))
+                (diskid, subdir, size) = value + [''] * (3 - len(value))
 
                 basepath = None
                 if (arch, diskid) in self.sourceDiskNames:
@@ -203,13 +194,11 @@ class DriverFile:
 
 
     def _parseStrings(self):
-        if not "strings" in self.sections: return
-
-        for key, value, _ in self.sections["strings"]:
-            self.strings[key] = value.strip('"').strip("'")
+        # the parser selects the Strings section and unquotes its values
+        self.strings = self.inf.strings
 
 
-    def _getSectionFiles(self, name: str, stack: set = set()):
+    def _getSectionFiles(self, name: str, stack: list[str] = list()) -> set[str]:
         name = name.lower()
         if name in self.sectionFiles:
             return self.sectionFiles[name]
@@ -223,8 +212,8 @@ class DriverFile:
             self.sectionFiles[name] = set()
             return set()
 
-        stack.add(name)
-        files = set()
+        stack.append(name)
+        files: set[str] = set()
         for key, value, _ in self.sections[name]:
             key = key.lower()
             filesOrSection = value.lower().split(',')
@@ -249,15 +238,15 @@ class DriverFile:
                             continue
 
                         # file-list-section only contain line separated file lists
-                        for key, value, _ in self.sections[f.lower()]:
-                            files.add(key.split(',')[0])
+                        for fileEntry, _, _ in self.sections[f.lower()]:
+                            files.add(fileEntry.split(',')[0])
 
         stack.remove(name)
         self.sectionFiles[name] = files
         return files
 
 
-    def _parseModelSection(self, section: str, TargetOSVersion: str, target: tuple):
+    def _parseModelSection(self, section: str, TargetOSVersion: str, target: tuple[str | None, str | None, str | None, str | None, str | None, str | None]):
         section = section.lower()
         TargetOSVersion = TargetOSVersion.lower()
 
@@ -268,7 +257,7 @@ class DriverFile:
         (arch, osma, osmi, product, suite, build) = target
         arch = arch.lower() if arch else None
 
-        modelSections = []
+        modelSections: list[str] = []
         if arch and f"{section}.{TargetOSVersion}" in self.sections:
             modelSections.append(f"{section}.{TargetOSVersion}")
         elif section in self.sections:
@@ -278,9 +267,14 @@ class DriverFile:
             print(f"error: model section {section} not found")
             return
 
-        deviceSections = {}
+        # device-description=install-section-name[,hw-id][,compatible-id...]
+        # The description belongs to the model entry, i.e. to the pair of install
+        # section and device id. The same id may be listed by several entries;
+        # Windows treats each entry as a separate driver candidate, so every
+        # (id, install section) pair becomes its own target.
+        deviceSections: dict[tuple[str, str], str] = {}
         for modelSection in modelSections:
-            for deviceDescription, installSectionAndDeviceID, _ in self.sections[modelSection]:
+            for _, installSectionAndDeviceID, entry in self.sections[modelSection]:
                 if not installSectionAndDeviceID or not ',' in installSectionAndDeviceID:
                     continue
 
@@ -292,40 +286,45 @@ class DriverFile:
                     print(f"error: device section {installSection} not found - {installSectionAndDeviceID}")
                     continue
 
+                # the parser already expanded %strkey% tokens (e.g. %DeviceDesc%)
+                deviceDescription = entry.key or ""
+
                 hardwareIDs = parts[1:]
                 for id in hardwareIDs:
                     id = id.strip().upper() # devmgmt.msc always shows only upper cased hardware ids (?)
                     if not id: continue
-                    if not id in deviceSections: deviceSections[id] = set()
-                    deviceSections[id].add(installSection)
+                    if (id, installSection) in deviceSections:
+                        if deviceSections[(id, installSection)] != deviceDescription:
+                            print(f"warning: {id} listed multiple times for {installSection} in [{modelSection}] (line {entry.line}), keeping the first description")
+                        continue
+                    deviceSections[(id, installSection)] = deviceDescription
 
-        for hardwareId in deviceSections:
-            sections = set()
-            for sectionName in deviceSections[hardwareId]:
-                if arch and f"{sectionName}.{arch}" in self.sections:
-                    sections.add(f"{sectionName}.{arch}")
-                elif f"{sectionName}.nt" in self.sections:
-                    sections.add(f"{sectionName}.nt")
-                elif sectionName in self.sections:
-                    sections.add(sectionName)
-                else:
-                    print(f"error: device section {sectionName} not found")
-                    continue
+        for (hardwareId, installSection), name in deviceSections.items():
+            sections: set[str] = set()
+            if arch and f"{installSection}.{arch}" in self.sections:
+                sections.add(f"{installSection}.{arch}")
+            elif f"{installSection}.nt" in self.sections:
+                sections.add(f"{installSection}.nt")
+            elif installSection in self.sections:
+                sections.add(installSection)
+            else:
+                print(f"error: device section {installSection} not found")
+                continue
 
-                for subtype in ["coinstallers", "services", "interfaces", "hw", "events", "components", "com"]:
-                    # coinstallers is deprecated for win10
-                    if arch and f"{sectionName}.{arch}.{subtype}" in self.sections:
-                        sections.add(f"{sectionName}.{arch}.{subtype}")
-                    elif f"{sectionName}.nt.{subtype}" in self.sections:
-                        sections.add(f"{sectionName}.nt.{subtype}")
-                    elif f"{sectionName}.{subtype}" in self.sections:
-                        sections.add(f"{sectionName}.{subtype}")
+            for subtype in ["coinstallers", "services", "interfaces", "hw", "events", "components", "com"]:
+                # coinstallers is deprecated for win10
+                if arch and f"{installSection}.{arch}.{subtype}" in self.sections:
+                    sections.add(f"{installSection}.{arch}.{subtype}")
+                elif f"{installSection}.nt.{subtype}" in self.sections:
+                    sections.add(f"{installSection}.nt.{subtype}")
+                elif f"{installSection}.{subtype}" in self.sections:
+                    sections.add(f"{installSection}.{subtype}")
 
-            files = set()
+            files: set[str] = set()
             for sectionName in sections:
                 files = files.union(self._getSectionFiles(sectionName))
 
-            mappedfiles = {self.infPath}
+            mappedfiles: set[pathlib.Path] = {self.infPath}
             for f in files:
                 if arch and (arch, f) in self.sourceDiskFiles:
                     mappedfiles.add(self.sourceDiskFiles[(arch, f)].joinpath(f))
@@ -339,13 +338,6 @@ class DriverFile:
             elif '' in self.catalogs:
                 mappedfiles = mappedfiles.union(self.catalogs[''])
 
-            name = deviceDescription
-            if deviceDescription.startswith('%') and deviceDescription.endswith('%'):
-                if deviceDescription[1:-1] in self.strings:
-                    name = self.strings[deviceDescription[1:-1]]
-                else:
-                    print(f"warning: device description {deviceDescription} not found in strings")
-            
             device = DriverTarget(hardwareId, name, self.date, self.version, list(mappedfiles))
             device.Architecture = arch
             device.OSMajorVersion = int(osma) if osma else None
@@ -356,7 +348,7 @@ class DriverFile:
             self.targets.append(device)
 
 
-    def _parseManufacturer(self, section = "manufacturer"):
+    def _parseManufacturer(self, section:str = "manufacturer"):
         if not section in self.sections: return
         # https://learn.microsoft.com/windows-hardware/drivers/install/inf-manufacturer-section
         for manufacturer, value, _ in self.sections[section]:
@@ -409,14 +401,14 @@ class DriverFile:
                 self.catalogs[arch].add(self.rootPath.joinpath(value))
             elif key == "driverver":
                 # mm/dd/yyyy,w.x.y.z
-                date = version = None
+                dateValue = version = None
                 if not ',' in value:
                     print(f"warning: version does not conform to spezification, mm/dd/yyyy,w.x.y.z expected, got {value}")
-                    date = value
+                    dateValue = value
                 else:
-                    date, version = value.split(',')
+                    dateValue, version = value.split(',')
 
-                date = date.strip() # note: strip should not be necessary for compliant files
+                dateValue = dateValue.strip() # note: strip should not be necessary for compliant files
                 if version:
                     try:
                         self.version = pkgver.Version(version)
@@ -424,19 +416,21 @@ class DriverFile:
                         print("error: invalid version value: " + version)
 
                 try:
-                    if date == "00/00/0000":
+                    if dateValue == "00/00/0000":
                         self.date = None
-                    elif '/' in date:
-                        self.date = datetime.strptime(date.strip(), "%m/%d/%Y")
-                    elif '-' in date:
-                        self.date = datetime.strptime(date.strip(), "%m-%d-%Y")
+                    elif '/' in dateValue:
+                        self.date = datetime.strptime(dateValue, "%m/%d/%Y").date()
+                    elif '-' in dateValue:
+                        self.date = datetime.strptime(dateValue, "%m-%d-%Y").date()
                     else:
-                        print("warning: unknown date format: " + date)
-                except Exception as e:
-                    print("error: invalid date value: " + date)
+                        print("warning: unknown date format: " + dateValue)
+                except ValueError:
+                    print("error: invalid date value: " + dateValue)
 
 class DriverDatabase:
-    def __init__(self, db_path):
+    db_path: str
+
+    def __init__(self, db_path: str):
         self.db_path = db_path
 
     def __enter__(self):
@@ -490,7 +484,7 @@ class DriverDatabase:
                 ON target(hwid, arch, os_major, os_minor, os_build)
             ''')
 
-    def addDriver(self, id: int | None, root: str, inf: str, container: str | None) -> int:
+    def addDriver(self, id: int | None, root: str, inf: str, container: str | None) -> int | None:
         with self.conn:
             if id:
                 self.conn.execute("INSERT OR IGNORE INTO driver (id, root, inf, container) VALUES (?, ?, ?, ?)", (id, root, inf, container if container else ""))
@@ -514,15 +508,18 @@ class DriverDatabase:
             res = cursor.fetchall()
             if res: return res[0][0]
 
-    def addTarget(self, driver, root, hwid, name, arch, os_major, os_minor, os_build, date: datetime, version: pkgver.Version) -> int:
+    def addTarget(self, driver: int, root: str, hwid: str, name: str, arch: str | None, os_major: int | None, os_minor: int | None, os_build: int | None, date: date | None, version: pkgver.Version | None) -> int | None:
+        # DriverVer versions have four parts (w.x.y.z), missing parts are 0
+        v_major, v_minor, v_patch, v_build = (version.release + (0, 0, 0, 0))[:4] if version else (None, None, None, None)
+        timestamp = datetime.combine(date, datetime.min.time()).timestamp() if date else None
         with self.conn:
             cursor = self.conn.execute("""
                 INSERT INTO target (driver, root, hwid, name, arch, os_major, os_minor, os_build, date, v_major, v_minor, v_patch, v_build)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
-                (driver, root, hwid, name, arch, os_major, os_minor, os_build, date.timestamp(), version.major, version.minor, version.micro, version.release[-1]))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (driver, root, hwid, name, arch, os_major, os_minor, os_build, timestamp, v_major, v_minor, v_patch, v_build))
             return cursor.lastrowid
 
-    def addFile(self, target: int, path: str) -> int:
+    def addFile(self, target: int, path: str) -> int | None:
         with self.conn:
             cursor = self.conn.execute(
                 "INSERT INTO file (target, path) VALUES (?, ?)", 
@@ -578,7 +575,7 @@ if __name__ == "__main__":
             _, ext = os.path.splitext(path)
             ext = ext.lower()
 
-            files = []
+            files: list[str] = []
             container = args.container
             wim = None
             if ext == ".wim":
@@ -620,8 +617,16 @@ if __name__ == "__main__":
                     os.makedirs(rootPath, exist_ok=True)
 
                 drvid = db.addDriver(drvid, rootPath, str(driver.infPath), container)
+                if not drvid:
+                    print(f"error: failed to add driver {file}")
+                    continue
+
                 for d in driver.targets:
                     tid = db.addTarget(drvid, str(d.root), d.HardwareID, d.DeviceDescription, d.Architecture, d.OSMajorVersion, d.OSMinorVersion, d.BuildNumber, d.date, d.version)
+                    if not tid:
+                        print(f"error: failed to add target {d.HardwareID} for {file}")
+                        continue
+
                     if not wim:
                         # we do not store built-in drivers as the use-case for wim-parsing
                         # is to check if driver for a device is built-in and not
