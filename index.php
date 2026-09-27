@@ -1,15 +1,20 @@
 <?php
+require_once 'lib.php';
 $config = require 'config.php';
 
 try {
-    $db = new PDO("sqlite:" . $config["db"], null, null, [PDO::SQLITE_ATTR_OPEN_FLAGS => PDO::SQLITE_OPEN_READONLY]);
-    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db = windrvOpenDb($config);
 } catch (Exception $e) {
     die("Database connection failed: " . $e->getMessage());
 }
 
-// Get search parameter
-$hwid_search = isset($_GET['hwid']) ? $_GET['hwid'] : '';
+// search parameters
+$hwid_search = trim($_GET['hwid'] ?? '');
+$arch_filter = $_GET['arch'] ?? '';
+$architectures = $db->query("SELECT DISTINCT arch FROM target ORDER BY arch")->fetchAll(PDO::FETCH_COLUMN);
+if (!in_array($arch_filter, $architectures, true)) {
+    $arch_filter = '';
+}
 
 // Pagination settings
 $per_page = 50;
@@ -17,46 +22,77 @@ $current_page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
 $offset = ($current_page - 1) * $per_page;
 
 // Build WHERE clause
-$where_clause = "";
+$conditions = [];
 $params = [];
+$rank = "0";
+$rank_params = [];
 
-if (!empty($hwid_search)) {
-    $where_clause = " WHERE hwid LIKE ?";
-    $params[] = '%' . $hwid_search . '%';
+// a full PCI device id (as shown by the device manager) is expanded to the ids Windows matches,
+// otherwise the search is a fragment of the hardware id (e.g. DEV_1533)
+$device = $hwid_search !== '' ? parsePciDeviceId($hwid_search) : null;
+if ($device) {
+    $device_ids = array_column(pciDeviceIds($device['ven'], $device['dev'], $device['subven'], $device['subsys'], $device['rev'], $device['class']), 0);
+    $conditions[] = "target.hwid IN (" . implode(',', array_fill(0, count($device_ids), '?')) . ")";
+    $params = array_merge($params, $device_ids);
+    // rank of the best matching id (position in the device's id list)
+    $rank = "MIN(CASE target.hwid " . str_repeat("WHEN ? THEN ? ", count($device_ids)) . "END)";
+    foreach ($device_ids as $position => $id) {
+        array_push($rank_params, $id, $position);
+    }
+} elseif ($hwid_search !== '') {
+    $conditions[] = "target.hwid LIKE ? ESCAPE '\\'";
+    $params[] = '%' . addcslashes($hwid_search, '%_\\') . '%';
 }
+if ($arch_filter !== '') {
+    $conditions[] = "target.arch = ?";
+    $params[] = $arch_filter;
+}
+$where_clause = $conditions ? " WHERE " . implode(" AND ", $conditions) : "";
+
+// one row per driver package, architecture and file set (targets with the same files)
+$group_by = " GROUP BY driver.id, target.arch, target.fileset";
 
 // Get total count
-$count_sql = "SELECT COUNT(*) FROM target" . $where_clause;
-$count_stmt = $db->prepare($count_sql);
+$count_stmt = $db->prepare("SELECT COUNT(*) FROM (SELECT 1 FROM target JOIN driver ON driver.id = target.driver" . $where_clause . $group_by . ")");
 $count_stmt->execute($params);
 $total_results = $count_stmt->fetchColumn();
 $total_pages = ceil($total_results / $per_page);
 
 // Build main query with pagination
 $sql = "SELECT
-    target.id,
-    target.name,
-    target.hwid,
-    target.v_major,
-    target.v_minor,
-    target.v_patch,
-    target.v_build,
+    MIN(target.id) AS id,
+    MIN(target.name) AS name,
+    MIN(target.hwid) AS hwid,
+    COUNT(*) AS matched,
+    SUM(target.kind = 'hardware') AS hardware,
     target.arch,
-    target.os_major,
-    target.os_minor,
-    target.os_build,
-    target.date,
+    target.fileset,
+    GROUP_CONCAT(DISTINCT NULLIF(models.decoration, '')) AS decorations,
+    MAX(target.date) AS date,
+    driver.version,
     driver.inf,
-    driver.container
+    driver.container,
+    driver.signed,
+    (SELECT SUM(size) FROM fileset_file WHERE fileset_file.fileset = target.fileset) AS size,
+    $rank AS rank
 FROM target
-JOIN driver ON driver.id = target.driver" . $where_clause . " ORDER BY target.date DESC, target.id DESC LIMIT ? OFFSET ?";
-
-$params[] = $per_page;
-$params[] = $offset;
+JOIN driver ON driver.id = target.driver
+JOIN models ON models.id = target.models" . $where_clause . $group_by . "
+ORDER BY rank, date DESC, driver.id DESC LIMIT ? OFFSET ?";
 
 $stmt = $db->prepare($sql);
-$stmt->execute($params);
+$stmt->execute(array_merge($rank_params, $params, [$per_page, $offset]));
 $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+function format_size(?int $bytes): string
+{
+    if ($bytes === null) return '';
+    foreach (['B', 'KB', 'MB', 'GB'] as $unit) {
+        if ($bytes < 1024 || $unit === 'GB') return ($unit === 'B' ? $bytes : number_format($bytes, 1)) . " $unit";
+        $bytes /= 1024;
+    }
+    return '';
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -186,6 +222,29 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
             cursor: pointer;
         }
 
+        .badge {
+            display: inline-block;
+            padding: 1px 6px;
+            margin-left: 4px;
+            border-radius: 3px;
+            background: #e9ecef;
+            color: #555;
+            font-size: 12px;
+        }
+
+        .badge.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            width: 100%;
+        }
+
         .pagination {
             display: flex;
             justify-content: center;
@@ -249,6 +308,7 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         <th>Windows</th>
                         <th>Version</th>
                         <th>File</th>
+                        <th>Size</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -258,7 +318,15 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             <input type="text" disabled placeholder="Filter disabled">
                         </td>
                         <td>
-                            <input type="text" name="hwid" value="<?php echo htmlspecialchars($hwid_search); ?>" placeholder="Search Hardware ID...">
+                            <input type="text" name="hwid" value="<?php echo htmlspecialchars($hwid_search); ?>" placeholder="DEV_1533 or PCI\VEN_..&DEV_..&SUBSYS_..">
+                        </td>
+                        <td>
+                            <select name="arch" onchange="this.form.submit()">
+                                <option value="">All architectures</option>
+                                <?php foreach ($architectures as $arch): ?>
+                                    <option value="<?php echo htmlspecialchars($arch); ?>"<?php echo $arch === $arch_filter ? ' selected' : ''; ?>><?php echo htmlspecialchars($arch); ?></option>
+                                <?php endforeach; ?>
+                            </select>
                         </td>
                         <td>
                             <input type="text" disabled placeholder="Filter disabled">
@@ -266,19 +334,17 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         <td>
                             <input type="text" disabled placeholder="Filter disabled">
                         </td>
-                        <td>
-                            <input type="text" disabled placeholder="Filter disabled">
-                        </td>
+                        <td></td>
                         <td>
                             <button type="submit">Search</button>
-                            <?php if (!empty($hwid_search)): ?>
+                            <?php if (!empty($hwid_search) || $arch_filter !== ''): ?>
                                 <a href="index.php" class="clear-btn" style="display: inline-block; padding: 8px 20px; text-decoration: none; color: white; border-radius: 4px;">Clear</a>
                             <?php endif; ?>
                         </td>
                     </tr>
                     <?php if (empty($results)): ?>
                         <tr>
-                            <td colspan="6" style="text-align: center; padding: 40px; color: #999;">
+                            <td colspan="7" style="text-align: center; padding: 40px; color: #999;">
                                 No drivers found. <?php echo !empty($hwid_search) ? 'Try a different search term.' : 'Database is empty.'; ?>
                             </td>
                         </tr>
@@ -290,52 +356,47 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                                 </td>
                                 <td>
                                     <span class="code"><?php echo htmlspecialchars($row['hwid']); ?></span>
+                                    <?php if ($row['matched'] > 1): ?>
+                                        <span class="badge" title="targets with the same files">+<?php echo $row['matched'] - 1; ?> more</span>
+                                    <?php endif; ?>
+                                    <?php if (!$row['hardware']): ?>
+                                        <span class="badge" title="only matched as compatible id">compatible</span>
+                                    <?php endif; ?>
                                 </td>
                                 <td>
                                     <?php
-                                        $arch = htmlspecialchars($row['arch'] ?? '');
-                                        $os_parts = array_filter([
-                                            $row['os_major'],
-                                            $row['os_minor'],
-                                            $row['os_build']
-                                        ], function($v) { return !is_null($v); });
-                                        $os_version = !empty($os_parts) ? implode('.', $os_parts) : '';
-                                        echo $os_version;
-                                        if ($os_version) echo ' ';
-                                        if ($arch) echo '(' . $arch . ')';
+                                        echo htmlspecialchars($row['arch']);
+                                        if ($row['decorations']) {
+                                            echo ' <span class="badge" title="TargetOSVersion">' . htmlspecialchars(str_replace(',', ', ', $row['decorations'])) . '</span>';
+                                        }
                                     ?>
                                 </td>
                                 <td>
                                     <?php
-                                        $version_parts = array_filter([
-                                            $row['v_major'],
-                                            $row['v_minor'],
-                                            $row['v_patch'],
-                                            $row['v_build']
-                                        ], function($v) { return !is_null($v); });
-
-                                        echo !empty($version_parts) ? implode('.', $version_parts) : '';
-                                        if ($version_parts) echo ' ';
-
+                                        echo htmlspecialchars($row['version'] ?? '');
                                         if ($row['date']) {
-                                            // Assuming date is stored as Unix timestamp
-                                            echo '(' . date('Y-m-d', $row['date']) . ')';
+                                            // stored as YYYY-MM-DD
+                                            echo ' (' . htmlspecialchars($row['date']) . ')';
                                         }
                                     ?>
                                 </td>
                                 <td>
-                                    <?php
-                                        if (!empty($row['inf'])) {
-                                            echo '<span class="code">' . htmlspecialchars($row['inf']) . '</span>';
-                                        } else {
-                                            echo '<span style="color: #ccc;">N/A</span>';
-                                        }
-                                    ?>
+                                    <span class="code"><?php echo htmlspecialchars($row['inf']); ?></span>
+                                    <?php if ($row['container'] !== ''): ?>
+                                        <span class="badge" title="built-in driver of WIM <?php echo htmlspecialchars($row['container']); ?>">WIM</span>
+                                    <?php elseif (!$row['signed']): ?>
+                                        <span class="badge warning" title="no CatalogFile, 64-bit WinPE does not load unsigned drivers">unsigned</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php echo format_size($row['size'] === null ? null : (int)$row['size']); ?>
                                 </td>
                                 <td>
                                     <?php
-                                        if (!preg_match('/^[a-zA-Z0-9]{32}$/', $row['container'] ?? '')) {
-                                            echo '<a href="download.php?target=' . $row['id'] . '&as=zip" class="download-link">Download</a>';
+                                        // built-in drivers of a WIM (container) have no files
+                                        if ($row['fileset'] !== null) {
+                                            echo '<a href="download.php?target=' . $row['id'] . '&as=zip" class="download-link">ZIP</a> ';
+                                            echo '<a href="download.php?target=' . $row['id'] . '" class="download-link">CAB</a>';
                                         } else {
                                             echo '<span style="color: #ccc; cursor: not-allowed;">Download</span>';
                                         }
@@ -355,6 +416,9 @@ $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 $query_params = [];
                 if (!empty($hwid_search)) {
                     $query_params['hwid'] = $hwid_search;
+                }
+                if ($arch_filter !== '') {
+                    $query_params['arch'] = $arch_filter;
                 }
 
                 function build_pagination_url($page, $query_params) {

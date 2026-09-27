@@ -198,7 +198,8 @@ class InfFile:
                 return self.strings[key.lower()]
             # numeric tokens are dirids (e.g. %13%) which are resolved at install time
             if not key.isdigit():
-                self.warn(line, f"string token %{key}% not defined in [{self.stringsSection or 'Strings'}]")
+                section = self.sections[self.stringsSection].name if self.stringsSection else "Strings"
+                self.warn(line, f"string token %{key}% not defined in [{section}]")
             return m.group(0)
 
         return _STRKEY_RE.sub(replace, value)

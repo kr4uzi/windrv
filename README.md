@@ -3,11 +3,11 @@ The main purpose of this software is to provide dynamic network card driver inje
 In essence, the windrvscan.py parses a .inf file and stores (hardware-id, windows, file) tuples in a sqlite3 database.
 
 The logic data layout is as follows:
-- driver (root-path, inf-file, container)
-- target (driver, windows-version, driver-version, hardware-id)
-- file (target, file)
+- driver (sha256 of the INF, container, package root, INF, class, provider, signed, DriverVer)
+- fileset (driver, architecture) with its files: the files a target needs, shared by all targets with the same files
+- target (driver, fileset, hardware-id, hardware/compatible, architecture, target OS version, DriverVer)
 
-A driver can be tagged with a container which is done automatically when processing wim files - in this case the container is the wim's guid. The allows a iPXE boot script to only inject a driver not contained by the boot/install wim.
+A driver can be tagged with a container which is done automatically when processing wim files - in this case the container is the wim's guid. The allows a iPXE boot script to only inject a driver not contained by the boot/install wim. Drivers of a container have targets but no files.
 
 
 # Setup
@@ -22,31 +22,58 @@ If you didn't install to /srv/windrv please adjust the first line of windrvscan.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install packaging wininfparser
+pip install packaging
 chmod +x windrvscan.py
 
 # make windrv available for pxe
 ln -s /srv/windrv /var/www/html/windrv
 ```
 
-Note: The database will store relative or absolute paths depending on how the inf file was provided.
+Note: Package folders are stored relative to the database directory if they are inside of it, otherwise as absolute paths.
 
 # Adding Builtin Drivers from WIMs
 `/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --class-filter=Net boot.wim`
 
 # Add and copy drivers from a directory
-`/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --store=AMD2026 /path/to/amd/drivers/driver.inf`
+`/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --store /path/to/amd/drivers/driver.inf`
 
-This will parse the driver.inf file but also copy driver files to the windrv/store/AMD2026 directory, allowing to store only the absolute minimum files required.
+This will parse the driver.inf file but also copy the driver files required by its targets to `store/<sha256 of the INF>` next to the database (or `--store-dir`), keeping the package layout and storing only the absolute minimum files required. The folder is content addressed: storing the same package again is a no-op and different versions of a driver never overwrite each other.
+
+`--fileset-scope section` (default) assigns each target the files of its install section, `--fileset-scope arch` all files of the driver for the target's architecture.
+
+# API
+`api.php` answers JSON and is the only interface to the database for other tools (e.g. the iPXE menu `pxe/win/menu.php`):
+
+- `api.php?action=match&container=<WIM GUID>&nics[0][ven]=8086&nics[0][dev]=1533&nics[0][subven]=8086&nics[0][subsys]=0001&nics[0][rev]=03&nics[0][class]=020000]`
+  returns per network adapter whether the WIM already has a driver (`covered`) and the best signed stored driver (`driver`, `inject`).
+  The WIM has to be scanned with `windrvscan.py` first (its GUID, architecture and Windows version are stored as container).
+  `&unsigned=1` also returns unsigned drivers (64-bit WinPE does not load them).
+- `api.php?action=targets&id[]=123` returns the INF path inside of the downloaded package (`download.php?target=123`).
+
+Matching follows Windows: the device ids are generated like the PCI bus driver does
+([Identifiers for PCI Devices](https://github.com/MicrosoftDocs/windows-driver-docs/blob/staging/windows-driver-docs-pr/install/identifiers-for-pci-devices.md)),
+only the Models section with the best applicable TargetOSVersion of each manufacturer is used and drivers are ranked by the matched id, signature, date and version.
+
+The web UI (`index.php`) searches hardware id fragments (`DEV_1533`) or complete device ids as shown by the device manager (`PCI\VEN_8086&DEV_1533&SUBSYS_00018086&REV_03`).
+
+Scanning a WIM uses image 1 by default (`--wim-image` for e.g. the edition of an install.wim).
 
 # TODOs
-- Implement support for "LayoutFile" (apparently only for the Version section and apparently only for Win2000 and WinXP)
 - Add support for DOS kernel handling (Win98)
+- Investigate `LayoutFile` ([Version], documented for Windows 2000/XP): used by system-supplied INFs instead of
+  SourceDisksNames/Files (e.g. from an XP `I386` folder, no WIM); currently ignored, file locations then unresolved
 - Add primitve Driver Support:
   -> Manufacturer section must *not* be present
   -> DefaultInstall.nt{amd64,...} must be present
-- Add Class Driver Support:
-   -> Potentially no hardware IDs are available (currently only HW IDs are stored)
+- Decide the default of `--fileset-scope` (files of a device's download package):
+  -> `section`: only the files of the device's install section (e.g. netathr10x.inf: 5 of 112 files)
+  -> `arch`: all files of the INF for the architecture (always complete)
+  -> Open question: does importing a package into the driver store (`drvload` in WinPE, `pnputil /add-driver`,
+     `DISM /Add-Driver`, "Browse my computer") require all files the INF references, or only those of the used install section?
+  -> Test: signed vendor network driver whose install sections copy different files, `pnputil /add-driver` of a
+     full, an `arch` and a `section` package on a Windows VM (`pnputil /delete-driver oemNN.inf` in between),
+     then confirm the winner with `drvload` in WinPE
+  -> Afterwards remove the option and keep the working mode; the store folder (`--store`) always holds all files
 
 # References
 ## About model section parsing:

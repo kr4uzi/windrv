@@ -4,40 +4,58 @@ if (!isset($_GET['target'])) {
     die("target is required");
 }
 
+require_once 'lib.php';
 $config = require 'config.php';
 
 try {
-    $db = new PDO("sqlite:" . $config["db"], null, null, [PDO::SQLITE_ATTR_OPEN_FLAGS => PDO::SQLITE_OPEN_READONLY]);
-    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db = windrvOpenDb($config);
 } catch (Exception $e) {
     die("Database connection failed. {$e}");
 }
 
 $stmt = $db->prepare(<<<SQL
-    SELECT driver.root as driver_root, target.root as target_root, target.id as target_id
+    SELECT driver.root, driver.inf, driver.version, target.arch, target.fileset
     FROM `target`
     JOIN driver ON driver.id = `target`.driver
     WHERE `target`.id = ?
 SQL);
 $stmt->execute([$_GET['target']]);
-$driver = $stmt->fetch(PDO::FETCH_ASSOC);
-if (!$driver) {
+$target = $stmt->fetch(PDO::FETCH_ASSOC);
+if (!$target) {
     die("target unknown");
 }
+if ($target['fileset'] === null) {
+    // built-in driver of a WIM (container), its files are not stored
+    die("target has no files");
+}
 
-$root = $driver['driver_root'] . DIRECTORY_SEPARATOR . $driver['target_root'];
+// driver.root is relative to the database directory unless it is absolute
+$root = $target['root'];
+if (!str_starts_with($root, '/')) {
+    $root = dirname($config["db"]) . DIRECTORY_SEPARATOR . $root;
+}
+$root = realpath($root);
+if (!$root) {
+    die("driver package not found");
+}
+
 $stmt = $db->prepare(<<<SQL
     SELECT `path`
-    FROM `file`
-    WHERE `target` = ?
+    FROM fileset_file
+    WHERE fileset = ?
+    ORDER BY `path`
 SQL);
-$stmt->execute([$driver['target_id']]);
-$files = $stmt->fetchAll(PDO::FETCH_ASSOC);
+$stmt->execute([$target['fileset']]);
+// <inf>-<version>-<arch>, e.g. e1r68x64-12.19.2.60-amd64
+$name = preg_replace('/[^A-Za-z0-9._-]/', '_',
+    implode('-', array_filter([pathinfo($target['inf'], PATHINFO_FILENAME), $target['version'], $target['arch']])));
+
 $paths = array();
-foreach ($files as $file) {
-    $file_path = realpath($root . DIRECTORY_SEPARATOR . $file['path']);
-    if ($file_path && file_exists($file_path)) {
-        $paths[] = $file['path'];
+foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $path) {
+    $file_path = realpath($root . DIRECTORY_SEPARATOR . $path);
+    // only files inside of the driver package
+    if ($file_path && is_file($file_path) && str_starts_with($file_path, $root . DIRECTORY_SEPARATOR)) {
+        $paths[] = $path;
     }
 }
 
@@ -53,7 +71,7 @@ if (isset($_GET['as']) && $_GET['as'] === 'zip') {
     }
     $zip->close();
     header('Content-Type: application/zip');
-    header('Content-Disposition: attachment; filename="driver.zip"');
+    header('Content-Disposition: attachment; filename="' . $name . '.zip"');
     header('Content-Length: ' . filesize($zipFile));
     flush();
     readfile($zipFile);
@@ -72,7 +90,7 @@ if (isset($_GET['as']) && $_GET['as'] === 'zip') {
     }
 
     header('Content-Type: application/vnd.ms-cab-compressed');
-    header('Content-Disposition: attachment; filename="driver.cab"');
+    header('Content-Disposition: attachment; filename="' . $name . '.cab"');
     header('Content-Length: ' . filesize($cabFile));
     flush();
     readfile($cabFile);

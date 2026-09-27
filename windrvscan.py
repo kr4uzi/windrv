@@ -2,81 +2,243 @@
 import os
 import shutil
 import subprocess
+import tempfile
 import argparse
+import hashlib
 import pathlib
 import infparser
 import sqlite3
+from xml.etree import ElementTree
 from packaging import version as pkgver
 from datetime import date, datetime
 
 
+ARCHITECTURES = ("x86", "ia64", "amd64", "arm", "arm64")
+# https://learn.microsoft.com/windows-hardware/drivers/install/inf-ddinstall-section
+DDINSTALL_SUBSECTIONS = ("coinstallers", "services", "interfaces", "hw", "events", "components", "software", "wmi", "factdef", "logconfigoverride", "filters")
+
+
+def parseTargetOSVersion(decoration: str) -> tuple[str, int | None, int | None, str | None, str | None, int | None] | None:
+    """
+    Parses a TargetOSVersion decoration into (arch, osMajor, osMinor, productType, suiteMask, build).
+    https://learn.microsoft.com/windows-hardware/drivers/install/inf-manufacturer-section
+    NT[Architecture][.[OSMajorVersion][.[OSMinorVersion][.[ProductType][.[SuiteMask][.[BuildNumber]]]]]]
+    Every field is optional; a missing architecture (NT) means x86 since Windows Server 2003 SP1.
+    Returns None for an invalid decoration.
+    """
+    parts = decoration.strip().split('.')
+    head = parts[0].lower()
+    if not head.startswith("nt") or len(parts) > 6:
+        return None
+
+    arch = head[2:] or "x86"
+    if arch not in ARCHITECTURES:
+        return None
+
+    major, minor, productType, suiteMask, build = (parts[1:] + [''] * 5)[:5]
+    for number in (major, minor, build):
+        if number and not number.isdigit():
+            return None
+    for flags in (productType, suiteMask):
+        if flags:
+            try:
+                int(flags, 0)
+            except ValueError:
+                return None
+
+    return (arch, int(major) if major else None, int(minor) if minor else None,
+            productType or None, suiteMask or None, int(build) if build else None)
+
+
+class SourceDisk:
+    # [SourceDisksNames[.arch]]
+    # diskid = disk-description[,[tag-or-cab-file],[unused],[path],[flags][,tag-file]]
+    path: pathlib.PurePosixPath
+    tagOrCabFile: str
+    flags: int
+    tagFile: str
+
+    def __init__(self, path: pathlib.PurePosixPath, tagOrCabFile: str, flags: int, tagFile: str):
+        self.path = path
+        self.tagOrCabFile = tagOrCabFile
+        self.flags = flags
+        self.tagFile = tagFile
+
+    def cabFile(self) -> str | None:
+        # with flags 0x10 tag-or-cab-file is always the cabinet, otherwise only if it has a .cab extension
+        if self.tagOrCabFile and (self.flags & 0x10 or self.tagOrCabFile.lower().endswith(".cab")):
+            return self.tagOrCabFile
+        return None
+
+    def tagFileName(self) -> str | None:
+        if self.flags & 0x10:
+            return self.tagFile or None
+        # a .cab file is used as both, tag and cabinet file
+        return self.tagOrCabFile or None
+
+
+class SourceFile:
+    # [SourceDisksFiles[.arch]]
+    # filename=diskid[,[subdir][,size]]
+    name: str
+    diskid: str
+    subdir: pathlib.PurePosixPath
+
+    def __init__(self, name: str, diskid: str, subdir: pathlib.PurePosixPath):
+        self.name = name
+        self.diskid = diskid
+        self.subdir = subdir
+
+
+def relativeInfPath(value: str) -> pathlib.PurePosixPath | None:
+    """
+    Converts an INF path (\\dir\\subdir, relative to the installation root) into a
+    relative posix path. Returns None if the path leaves the installation root.
+    """
+    parts: list[str] = []
+    for part in pathlib.PureWindowsPath(value.strip()).parts:
+        if part in ('\\', '/') or part.endswith(':\\') or part.endswith(':'):
+            continue
+        if part == '..':
+            if not parts:
+                return None
+            parts.pop()
+        elif part != '.':
+            parts.append(part)
+    return pathlib.PurePosixPath(*parts)
+
+
+class ModelsDecoration:
+    """A Models section listed in [Manufacturer] (models-section-name[.TargetOSVersion])."""
+    # undecorated Models section name as listed (section names are case-insensitive)
+    section: str
+    # TargetOSVersion as listed ('' for an undecorated entry)
+    decoration: str
+    arch: str
+    osMajor: int | None
+    osMinor: int | None
+    productType: int | None
+    suiteMask: int | None
+    build: int | None
+
+    def __init__(self, section: str, decoration: str, arch: str, osMajor: int | None = None, osMinor: int | None = None,
+                 productType: str | None = None, suiteMask: str | None = None, build: int | None = None):
+        self.section = section
+        self.decoration = decoration
+        self.arch = arch
+        self.osMajor = osMajor
+        self.osMinor = osMinor
+        self.productType = int(productType, 0) if productType else None
+        self.suiteMask = int(suiteMask, 0) if suiteMask else None
+        self.build = build
+
+    def sectionName(self) -> str:
+        return f"{self.section}.{self.decoration}" if self.decoration else self.section
+
+
 class DriverTarget:
     HardwareID: str
+    # "hardware" for the hardware id of a models entry, "compatible" for compatible ids
+    Kind: str
     DeviceDescription: str
     date: date | None
     version: pkgver.Version | None
     Architecture: str | None
     OSMajorVersion: int | None
     OSMinorVersion: int | None
-    ProductType: str | None
-    SuiteMask: str | None
+    ProductType: int | None
+    SuiteMask: int | None
     BuildNumber: int | None
-    root: pathlib.Path
+    # the DDInstall section (with its platform extension) installing this target
+    InstallSection: str
+    # the Models section listing this target
+    Models: ModelsDecoration
+    # files of the driver package required by this target (including the INF)
     files: set[pathlib.Path]
 
-    def __init__(self, hardwareID: str, deviceDescription: str, date: date | None, version: pkgver.Version | None, files: list[pathlib.Path]):
+    def __init__(self, hardwareID: str, deviceDescription: str, date: date | None, version: pkgver.Version | None, files: set[pathlib.Path]):
         self.HardwareID = hardwareID
+        self.Kind = "hardware"
         self.DeviceDescription = deviceDescription
         self.date = date
         self.version = version
         self.Architecture = self.OSMajorVersion = self.OSMinorVersion = self.ProductType = self.SuiteMask = self.BuildNumber = None
-
-        if len(files) == 1:
-            # if there is only one file, the commonpath would be the file itself which we need to prevent
-            self.root = files[0].parent
-        else:
-            self.root = pathlib.Path(os.path.commonpath(files))
-
-        self.files = { p.relative_to(self.root) for p in files }
+        self.InstallSection = ""
+        self.files = files
 
 
 class DriverFile:
     valid: bool
     klass: str
+    provider: str
+    # sha256 of the INF file, identifies the driver package
+    sha256: str
     infPath: pathlib.Path
     rootPath: pathlib.Path
-    version: pkgver.Version
+    version: pkgver.Version | None
     date: date | None
     targets: list[DriverTarget]
+    # every Models section listed in [Manufacturer], also empty or missing ones (they exclude a target OS)
+    models: list[ModelsDecoration]
     inf: infparser.InfFile
     sections: dict[str, list[tuple[str, str, infparser.Entry]]]
-    catalogs: dict[str, set[pathlib.Path]]
+    # CatalogFile[.decoration] from [Version], keyed by decoration ('', 'nt', 'ntamd64', ...),
+    # relative to the INF directory
+    catalogFiles: dict[str, pathlib.PurePosixPath]
     sectionFiles: dict[str, set[str]]
-    # tuple(arch, diskid)
-    sourceDiskNames: dict[tuple[str, str], pathlib.Path]
-    # tuple(arch, filename)
-    sourceDiskFiles: dict[tuple[str, str], pathlib.Path]
+    # (ddinstall, subsection) pairs already reported as ignored due to a decoration mismatch
+    ignoredSubsections: set[tuple[str, str]]
+    # tuple(arch, diskid), arch is '' for the undecorated section
+    sourceDiskNames: dict[tuple[str, str], SourceDisk]
+    # tuple(arch, lowercased filename), arch is '' for the undecorated section
+    sourceDiskFiles: dict[tuple[str, str], SourceFile]
+    # tuple(arch, lowercased filename) -> resolved files (the file itself or its cabinet, plus tag file)
+    resolvedFiles: dict[tuple[str, str], set[pathlib.Path]]
+    # directory -> {lowercased name: name}, for case-insensitive lookups
+    directoryListings: dict[pathlib.Path, dict[str, str]]
+    # resolved paths of all INFs of this scan (CopyINF recursion)
+    visited: set[str]
+    copyInfs: dict[str, "DriverFile | None"]
+    # CopyINF value -> located INF (None if invalid or missing)
+    copyInfPaths: dict[str, pathlib.Path | None]
+    # files are not available locally (built-in drivers from a WIM image)
+    wim: bool
     # key to value mapping for string replacement (e.g. %strkey% in the model section)
     strings: dict[str, str]
 
-    def __init__(self, path: str, wim: tuple[str, int] | None = None):
+    def __init__(self, path: str, data: bytes | None = None, visited: set[str] | None = None):
+        """
+        path: the INF file; for built-in drivers of a WIM image its path inside the image, with its
+        content passed as data (the files of the driver package are not available then)
+        """
         self.valid = False
         self.klass = ""
+        self.provider = ""
         self.infPath = pathlib.Path(path)
         self.rootPath = self.infPath.parent
+        self.version = None
+        self.date = None
         self.sections = {}
-        self.catalogs = {}
+        self.catalogFiles = {}
         self.sectionFiles = {}
+        self.ignoredSubsections = set()
         self.sourceDiskNames = {}
         self.sourceDiskFiles = {}
+        self.resolvedFiles = {}
+        self.directoryListings = {}
+        self.wim = data is not None
+        self.visited = visited if visited is not None else set()
+        self.visited.add(str(self.infPath.resolve()) if not self.wim else path)
+        self.copyInfs = {}
+        self.copyInfPaths = {}
         self.strings = {}
         self.targets = []
+        self.models = []
 
-        if wim:
-            data = subprocess.run(["wimextract", wim[0], str(wim[1]), path, "--to-stdout"], capture_output=True).stdout
-            self.inf = infparser.InfFile.load(data, name=path)
-        else:
-            self.inf = infparser.InfFile.load(path)
+        if data is None:
+            data = pathlib.Path(path).read_bytes()
+        self.sha256 = hashlib.sha256(data).hexdigest()
+        self.inf = infparser.InfFile.load(data, name=path)
 
         for warning in self.inf.warnings:
             print("warning: " + warning)
@@ -101,6 +263,13 @@ class DriverFile:
             print("error: no version section found")
             return
 
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-version-section
+        # If signature-name is none of these string values, the file is not accepted as a valid INF
+        signatures = [entry.values[0] for key, _, entry in self.sections["version"] if key == "signature" and entry.values]
+        if not signatures or signatures[0].lower() not in ("$windows nt$", "$chicago$"):
+            print(f"error: invalid signature {signatures[0] if signatures else '(missing)'}, expected \"$Windows NT$\" or \"$Chicago$\"")
+            return
+
         self._parseVersion()
         self.valid = True
 
@@ -110,92 +279,239 @@ class DriverFile:
         self._parseStrings()
         self._parseManufacturer()
 
-        if len(self.targets):
-            root = pathlib.Path(os.path.commonpath([p.root for p in self.targets]))
-            self.infPath = self.infPath.relative_to(root)
-            self.rootPath = root
-            for t in self.targets:
-                t.root = t.root.relative_to(self.rootPath)
+
+
+    def _sourceDisksArch(self, section: str) -> str | None:
+        # the platform extensions of SourceDisksNames/SourceDisksFiles are .x86, .amd64, ...
+        # and not .ntx86, .ntamd64, ... like for other sections
+        arch = section.split('.', 1)[1] if '.' in section else ''
+        if arch == '' or arch in ARCHITECTURES:
+            return arch
+        if arch.startswith("nt") and arch[2:] in ARCHITECTURES:
+            print(f"warning: [{section}] is ignored, the platform extension must be .{arch[2:]} (not .{arch})")
+        else:
+            print(f"warning: [{section}] has an unknown platform extension")
+        return None
 
 
     def _parseSourceFiles(self):
-        for section in self.sections:
-            if not section.startswith("sourcedisksnames"):
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-sourcedisksnames-section
+        for section in self.inf.sectionNames():
+            if section != "sourcedisksnames" and not section.startswith("sourcedisksnames."):
+                continue
+            arch = self._sourceDisksArch(section)
+            if arch is None:
                 continue
 
-            arch = section[section.find('.') + 1:] if '.' in section else ''
-            for diskid, value, _ in self.sections[section]:
-                value = value.split(',')
-                if arch not in self.catalogs: self.catalogs[arch] = set()
-
+            for entry in self.inf.entries(section):
                 # diskid = disk-description[,tag-or-cab-file] |
                 # diskid = disk-description[,[tag-or-cab-file][,[unused][,path]]] |
                 # diskid = disk-description[,[tag-or-cab-file],[unused],[path][,flags]] |
                 # diskid = disk-description[,[tag-or-cab-file],[unused],[path],[flags][,tag-file]]  (Windows XP and later versions of Windows)
-                (desc, tagOrCabFile, _, path, flags, tagFile) = value + [''] * (6 - len(value))
+                diskid = (entry.key or "").strip()
+                if not diskid.isdigit():
+                    print(f"warning: invalid diskid {diskid!r} in [{section}] (line {entry.line})")
+                    continue
+                (_, tagOrCabFile, _, path, flags, tagFile) = (entry.values + [''] * 6)[:6]
+
+                # path is relative to the installation root (the INF directory)
+                diskPath = relativeInfPath(path)
+                if diskPath is None:
+                    print(f"error: path {path} of diskid {diskid} leaves the driver package (line {entry.line})")
+                    continue
+
+                try:
+                    diskFlags = int(flags, 0) if flags else 0
+                except ValueError:
+                    print(f"warning: invalid flags {flags} for diskid {diskid} (line {entry.line})")
+                    diskFlags = 0
 
                 if (arch, diskid) in self.sourceDiskNames:
-                    print(f"warning: diskid {diskid} defined path multiple times (section: {section})")
+                    print(f"warning: diskid {diskid} defined multiple times in [{section}] (line {entry.line})")
+                    continue
+                self.sourceDiskNames[(arch, diskid)] = SourceDisk(diskPath, tagOrCabFile, diskFlags, tagFile)
 
-                if path:
-                    path = path.strip('"')
-                    path = pathlib.Path(pathlib.PureWindowsPath(path).as_posix())
-                    if path.is_absolute():
-                        path = pathlib.Path(*path.parts[1:])
-                    self.sourceDiskNames[(arch, diskid)] = self.rootPath.joinpath(path)
-                else:
-                    self.sourceDiskNames[(arch, diskid)] = self.rootPath
-
-                if tagOrCabFile:
-                    tagPath = self.sourceDiskNames[(arch, diskid)].joinpath(tagOrCabFile)
-                    if not arch in self.catalogs: self.catalogs[arch] = set()
-                    if tagPath in self.catalogs[arch]:
-                        print(f"warning: tag-or-cab-file {tagOrCabFile} appeared multiple times (section: {section})")
-                    else:
-                        self.catalogs[arch].add(tagPath)
-
-                if tagFile:
-                    tagPath = self.sourceDiskNames[(arch, diskid)].joinpath(tagFile)
-
-                    if not arch in self.catalogs: self.catalogs[arch] = set()
-                    if tagPath in self.catalogs[arch]:
-                        print(f"warning: tag-file {tagFile} appeared multiple times (section: {section})")
-                    else:
-                        self.catalogs[arch].add(tagPath)
-
-        for section in self.sections:
-            if not section.startswith("sourcedisksfiles"):
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-sourcedisksfiles-section
+        for section in self.inf.sectionNames():
+            if section != "sourcedisksfiles" and not section.startswith("sourcedisksfiles."):
+                continue
+            arch = self._sourceDisksArch(section)
+            if arch is None:
                 continue
 
-            arch = section[section.find('.') + 1:] if '.' in section else ''
-            for filename, value, _ in self.sections[section]:
-                if (arch, filename) in self.sourceDiskFiles:
-                    print(f"warning: {filename} path already configured for {arch}")
+            for entry in self.inf.entries(section):
+                # filename=diskid[,[ subdir][,size]], the file name must be the exact name (no %strkey%)
+                if entry.rawKey is None or not entry.values or not entry.values[0]:
+                    print(f"warning: missing diskid in [{section}] (line {entry.line})")
+                    continue
+                filename = entry.rawKey
+                subdir = relativeInfPath(entry.values[1]) if len(entry.values) > 1 else pathlib.PurePosixPath()
+                if subdir is None:
+                    print(f"error: subdir of {filename} leaves the driver package (line {entry.line})")
+                    continue
+                if (arch, filename.lower()) in self.sourceDiskFiles:
+                    print(f"warning: {filename} listed multiple times in [{section}] (line {entry.line})")
+                    continue
+                self.sourceDiskFiles[(arch, filename.lower())] = SourceFile(filename, entry.values[0].strip(), subdir)
 
-                value = value.split(',')
-                # filename=diskid[,[ subdir][,size]]
-                (diskid, subdir, size) = value + [''] * (3 - len(value))
 
-                basepath = None
-                if (arch, diskid) in self.sourceDiskNames:
-                    basepath = self.sourceDiskNames[(arch, diskid)]
-                elif ('', diskid) in self.sourceDiskNames:
-                    basepath = self.sourceDiskNames[('', diskid)]
-                else:
-                    basepath = self.rootPath
+    def _locate(self, relative: pathlib.PurePosixPath) -> pathlib.Path | None:
+        """Finds a file relative to the INF directory, ignoring the case like Windows does."""
+        if self.wim:
+            # files of built-in drivers are not available
+            return self.rootPath.joinpath(relative)
 
-                if subdir:
-                    subdir = pathlib.Path(pathlib.PureWindowsPath(subdir).as_posix())
-                    if subdir.is_absolute():
-                        subdir = pathlib.Path(*subdir.parts[1:])
-                    self.sourceDiskFiles[(arch, filename)] = basepath.joinpath(subdir)
-                else:
-                    self.sourceDiskFiles[(arch, filename)] = basepath
+        # always use the name from the directory listing, so the result is the actual
+        # file name on case-sensitive and case-insensitive file systems alike
+        current = self.rootPath
+        for part in relative.parts:
+            if current not in self.directoryListings:
+                try:
+                    self.directoryListings[current] = {name.lower(): name for name in os.listdir(current)}
+                except OSError:
+                    self.directoryListings[current] = {}
+            match = self.directoryListings[current].get(part.lower())
+            if match is None:
+                return None
+            current = current.joinpath(match)
+        return current if current.is_file() else None
+
+
+    def _resolveSourceFile(self, name: str, arch: str) -> set[pathlib.Path]:
+        """
+        Maps a source file name of a CopyFiles directive to its location in the driver package:
+        [SourceDisksFiles.arch] -> [SourceDisksFiles] for the file, [SourceDisksNames.arch] ->
+        [SourceDisksNames] for its disk. Returns the file (or its cabinet) and the disk's tag file.
+        """
+        key = (arch, name.lower())
+        if key in self.resolvedFiles:
+            return self.resolvedFiles[key]
+
+        resolved: set[pathlib.Path] = set()
+        self.resolvedFiles[key] = resolved
+
+        sourceFile = self.sourceDiskFiles.get(key) or self.sourceDiskFiles.get(('', name.lower()))
+        disk = None
+        if sourceFile is None:
+            print(f"warning: {name} is not listed in [SourceDisksFiles] for {arch}, assuming it is next to the INF")
+            relative = pathlib.PurePosixPath(name)
+        else:
+            disk = self.sourceDiskNames.get((arch, sourceFile.diskid)) or self.sourceDiskNames.get(('', sourceFile.diskid))
+            if disk is None:
+                print(f"warning: {name} uses diskid {sourceFile.diskid}, which is not listed in [SourceDisksNames] for {arch}")
+                relative = sourceFile.subdir.joinpath(sourceFile.name)
+            else:
+                relative = disk.path.joinpath(sourceFile.subdir, sourceFile.name)
+
+        path = self._locate(relative)
+        if path is None and disk and disk.cabFile():
+            # files that cannot be found on the media are extracted from the disk's cabinet file
+            path = self._locate(disk.path.joinpath(disk.cabFile() or ""))
+        if path is None:
+            print(f"error: {relative} not found in the driver package ({arch})")
+        else:
+            resolved.add(path)
+
+        # tag files are optional for fixed media, include them if present
+        if disk and disk.tagFileName():
+            tag = self._locate(disk.path.joinpath(disk.tagFileName() or ""))
+            if tag:
+                resolved.add(tag)
+
+        return resolved
+
+
+    def _copyInfFiles(self, value: str, arch: str) -> set[pathlib.Path]:
+        """
+        https://learn.microsoft.com/windows-hardware/drivers/install/inf-copyinf-directive
+        The INF must reside in the directory of this INF or a subdirectory. Starting with
+        Windows Vista the complete driver package of the INF is copied to the driver store
+        (recursively), so all of its files for the architecture are required as well.
+        """
+        if value.lower() in self.copyInfPaths:
+            path = self.copyInfPaths[value.lower()]
+        else:
+            relative = relativeInfPath(value)
+            path = None
+            if relative is None or not relative.parts:
+                print(f"error: invalid CopyINF {value}, the INF must be in the driver package")
+            else:
+                path = self._locate(relative)
+                if path is None:
+                    print(f"error: CopyINF {relative} not found in the driver package")
+            self.copyInfPaths[value.lower()] = path
+
+        if path is None:
+            return set()
+        if self.wim:
+            return {path}
+
+        key = str(path.resolve())
+        if key not in self.copyInfs:
+            if key in self.visited:
+                # already part of this scan (e.g. INFs referencing each other)
+                self.copyInfs[key] = None
+            else:
+                child = DriverFile(str(path), visited=self.visited)
+                if child.valid:
+                    child.parseDevices()
+                self.copyInfs[key] = child if child.valid else None
+
+        files = {path}
+        child = self.copyInfs[key]
+        if child:
+            for t in child.targets:
+                if t.Architecture == arch:
+                    files.update(t.files)
+        return files
 
 
     def _parseStrings(self):
         # the parser selects the Strings section and unquotes its values
         self.strings = self.inf.strings
+
+
+    def _fileSections(self, ddinstall: str, installSection: str, arch: str) -> set[str]:
+        """
+        Sections of a device install that may contain CopyFiles directives:
+        https://learn.microsoft.com/windows-hardware/drivers/install/inf-copyfiles-directive
+        DDInstall, DDInstall.CoInstallers, add-interface sections (AddInterface in
+        DDInstall.Interfaces), install-interface sections of [InterfaceInstall32]
+        and ClassInstall32[.nt<arch>|.nt].
+        """
+        sections = {ddinstall}
+
+        # all related DDInstall sections (.Services, .HW, .Interfaces, ...) must use the
+        # same platform extension as the chosen DDInstall section, others are not processed
+        # https://learn.microsoft.com/windows-hardware/drivers/install/combining-platform-extensions-with-other-section-name-extensions
+        decorations = ["", ".nt"] + [f".nt{a}" for a in ARCHITECTURES]
+        chosen = ddinstall[len(installSection):]
+        for sub in DDINSTALL_SUBSECTIONS:
+            if f"{ddinstall}.{sub}" in self.sections:
+                continue
+            others = [f"{installSection}{d}.{sub}" for d in decorations if d != chosen and f"{installSection}{d}.{sub}" in self.sections]
+            if others and (ddinstall, sub) not in self.ignoredSubsections:
+                self.ignoredSubsections.add((ddinstall, sub))
+                print(f"warning: [{others[0]}] is not used for [{ddinstall}], expected [{ddinstall}.{sub}]")
+
+        if f"{ddinstall}.coinstallers" in self.sections:
+            sections.add(f"{ddinstall}.coinstallers")
+
+        # AddInterface={InterfaceClassGUID}[,[reference-string][,[add-interface-section][,flags]]]
+        for key, _, entry in self.sections.get(f"{ddinstall}.interfaces", []):
+            if key == "addinterface" and len(entry.values) > 2 and entry.values[2]:
+                sections.add(entry.values[2].lower())
+
+        # {InterfaceClassGUID}=install-interface-section[,flags]
+        for entry in self.inf.entries("interfaceinstall32"):
+            if entry.values and entry.values[0]:
+                sections.add(entry.values[0].lower())
+
+        classInstall = self.inf.resolveDecorated("classinstall32", arch)
+        if classInstall:
+            sections.add(classInstall)
+
+        return sections
 
 
     def _getSectionFiles(self, name: str, stack: list[str] = list()) -> set[str]:
@@ -214,9 +530,7 @@ class DriverFile:
 
         stack.append(name)
         files: set[str] = set()
-        for key, value, _ in self.sections[name]:
-            key = key.lower()
-            filesOrSection = value.lower().split(',')
+        for key, _, entry in self.sections[name]:
             # ignoring "include":
             # this is for system supplied INF files which therefore are fully
             # included in the system already
@@ -224,47 +538,53 @@ class DriverFile:
             # ignoring "needs":
             # this is for sections in system supplied INF files which are
             # means all the files are already present in the system
-            if key == "copyinf":
-                for f in filesOrSection:
-                    files.add(f.strip())
-            elif key == "copyfiles":
-                for f in filesOrSection:
-                    f = f.strip()
-                    if f.startswith('@'):
-                        files.add(f[1:])
-                    else:
-                        if f not in self.sections:
-                            print("error: section not found: " + f)
-                            continue
+            if key != "copyfiles":
+                continue
 
-                        # file-list-section only contain line separated file lists
-                        for fileEntry, _, _ in self.sections[f.lower()]:
-                            files.add(fileEntry.split(',')[0])
+            # CopyFiles=@filename | file-list-section[,file-list-section]...
+            # file names must be exact names on the source media (no %strkey%)
+            for value in entry.rawValues:
+                if not value:
+                    continue
+                if value.startswith('@'):
+                    files.add(value[1:].strip())
+                    continue
+
+                fileList = self.inf.expand(value, entry.line).lower()
+                if fileList not in self.sections:
+                    # sections may also be defined by system-supplied INFs listed in an Include
+                    # directive, their files are part of Windows and not of this driver package
+                    includes = [v for k, _, e in self.sections[name] if k == "include" for v in e.values if v]
+                    if includes:
+                        print(f"info: file list section [{fileList}] not found, assuming it is defined by {', '.join(includes)} (line {entry.line})")
+                    else:
+                        print(f"error: file list section [{fileList}] not found (line {entry.line})")
+                    continue
+
+                # destination-file-name[,source-file-name][,unused][,flag]
+                # the source file name is the file in the driver package
+                for fileEntry in self.inf.entries(fileList):
+                    if not fileEntry.rawValues or not fileEntry.rawValues[0]:
+                        continue
+                    source = fileEntry.rawValues[1] if len(fileEntry.rawValues) > 1 and fileEntry.rawValues[1] else fileEntry.rawValues[0]
+                    files.add(source)
 
         stack.remove(name)
         self.sectionFiles[name] = files
         return files
 
 
-    def _parseModelSection(self, section: str, TargetOSVersion: str, target: tuple[str | None, str | None, str | None, str | None, str | None, str | None]):
-        section = section.lower()
-        TargetOSVersion = TargetOSVersion.lower()
-
+    def _parseModelSection(self, models: ModelsDecoration):
+        modelSection = models.sectionName()
+        arch = models.arch
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-models-section
         # A per-manufacturer Models section identifies at least one device,
         # references the DDInstall section of the INF file for that device,
         # and specifies a unique-to-the-model-section Hardware identifier (ID) for that device.
-
-        (arch, osma, osmi, product, suite, build) = target
-        arch = arch.lower() if arch else None
-
-        modelSections: list[str] = []
-        if arch and f"{section}.{TargetOSVersion}" in self.sections:
-            modelSections.append(f"{section}.{TargetOSVersion}")
-        elif section in self.sections:
-            modelSections.append(section)
-
-        if len(modelSections) == 0:
-            print(f"error: model section {section} not found")
+        if not self.inf.has(modelSection):
+            # Windows does not fall back to a differently decorated (or undecorated) Models
+            # section, so the INF does not apply to this target OS (like an empty section)
+            print(f"warning: models section [{modelSection}] not found, the INF does not apply to this target OS")
             return
 
         # device-description=install-section-name[,hw-id][,compatible-id...]
@@ -272,263 +592,536 @@ class DriverFile:
         # section and device id. The same id may be listed by several entries;
         # Windows treats each entry as a separate driver candidate, so every
         # (id, install section) pair becomes its own target.
-        deviceSections: dict[tuple[str, str], str] = {}
-        for modelSection in modelSections:
-            for _, installSectionAndDeviceID, entry in self.sections[modelSection]:
-                if not installSectionAndDeviceID or not ',' in installSectionAndDeviceID:
-                    continue
-
-                parts = installSectionAndDeviceID.split(',')
-                installSection = parts[0].strip().lower()
-                if f"{installSection}.{arch}" in self.sections: installSection = f"{installSection}.{arch}"
-                elif f"{installSection}.nt" in self.sections: installSection = f"{installSection}.nt"
-                elif installSection not in self.sections:
-                    print(f"error: device section {installSection} not found - {installSectionAndDeviceID}")
-                    continue
-
-                # the parser already expanded %strkey% tokens (e.g. %DeviceDesc%)
-                deviceDescription = entry.key or ""
-
-                hardwareIDs = parts[1:]
-                for id in hardwareIDs:
-                    id = id.strip().upper() # devmgmt.msc always shows only upper cased hardware ids (?)
-                    if not id: continue
-                    if (id, installSection) in deviceSections:
-                        if deviceSections[(id, installSection)] != deviceDescription:
-                            print(f"warning: {id} listed multiple times for {installSection} in [{modelSection}] (line {entry.line}), keeping the first description")
-                        continue
-                    deviceSections[(id, installSection)] = deviceDescription
-
-        for (hardwareId, installSection), name in deviceSections.items():
-            sections: set[str] = set()
-            if arch and f"{installSection}.{arch}" in self.sections:
-                sections.add(f"{installSection}.{arch}")
-            elif f"{installSection}.nt" in self.sections:
-                sections.add(f"{installSection}.nt")
-            elif installSection in self.sections:
-                sections.add(installSection)
-            else:
-                print(f"error: device section {installSection} not found")
+        deviceSections: dict[tuple[str, str], tuple[str, str]] = {}
+        for entry in self.inf.entries(modelSection):
+            if entry.key is None or not entry.values or not entry.values[0]:
+                print(f"warning: models entry without install section in [{modelSection}] (line {entry.line})")
                 continue
 
-            for subtype in ["coinstallers", "services", "interfaces", "hw", "events", "components", "com"]:
-                # coinstallers is deprecated for win10
-                if arch and f"{installSection}.{arch}.{subtype}" in self.sections:
-                    sections.add(f"{installSection}.{arch}.{subtype}")
-                elif f"{installSection}.nt.{subtype}" in self.sections:
-                    sections.add(f"{installSection}.nt.{subtype}")
-                elif f"{installSection}.{subtype}" in self.sections:
-                    sections.add(f"{installSection}.{subtype}")
+            installSection = entry.values[0].lower()
+            deviceIds = entry.values[1:]
+            # INFs are required to specify at least one device ID for each entry
+            if not any(deviceIds):
+                print(f"warning: models entry without hardware or compatible id in [{modelSection}] (line {entry.line})")
+                continue
+
+            if self.inf.resolveDecorated(installSection, arch) is None:
+                print(f"error: install section [{installSection}] for {arch} not found (line {entry.line})")
+                continue
+
+            # the parser already expanded %strkey% tokens (e.g. %DeviceDesc%)
+            deviceDescription = entry.key
+            for index, id in enumerate(deviceIds):
+                id = id.upper() # devmgmt.msc always shows only upper cased hardware ids (?)
+                if not id: continue
+                # the first id is the hardware id, the following ones are compatible ids
+                kind = "hardware" if index == 0 else "compatible"
+                existing = deviceSections.get((id, installSection))
+                if existing:
+                    if existing[0] != deviceDescription:
+                        print(f"warning: {id} listed multiple times for {installSection} in [{modelSection}] (line {entry.line}), keeping the first description")
+                    if kind == "hardware" and existing[1] != kind:
+                        deviceSections[(id, installSection)] = (existing[0], kind)
+                    continue
+                deviceSections[(id, installSection)] = (deviceDescription, kind)
+
+        for (hardwareId, installSection), (name, kind) in deviceSections.items():
+            # install-section-name.nt<arch> -> install-section-name.nt -> install-section-name
+            ddinstall = self.inf.resolveDecorated(installSection, arch)
+            if ddinstall is None:
+                continue
+
+            # ExcludeID: the DDInstall section does not install devices with these ids
+            # (only processed when specified directly in the DDInstall section)
+            excluded = {v.upper() for key, _, entry in self.sections[ddinstall] if key == "excludeid" for v in entry.values if v}
+            if hardwareId in excluded:
+                continue
+
+            sections: set[str] = {ddinstall}
+
+            # DriverVer in a DDInstall section takes precedence over the one in [Version]
+            targetDate, targetVersion = self.date, self.version
+            driverVers = [entry for key, _, entry in self.sections[ddinstall] if key == "driverver"]
+            if driverVers:
+                targetDate, targetVersion = self._parseDriverVer(driverVers[0])
+
+            sections.update(self._fileSections(ddinstall, installSection, arch))
 
             files: set[str] = set()
             for sectionName in sections:
                 files = files.union(self._getSectionFiles(sectionName))
 
             mappedfiles: set[pathlib.Path] = {self.infPath}
-            for f in files:
-                if arch and (arch, f) in self.sourceDiskFiles:
-                    mappedfiles.add(self.sourceDiskFiles[(arch, f)].joinpath(f))
-                elif ('', f) in self.sourceDiskFiles:
-                    mappedfiles.add(self.sourceDiskFiles[('', f)].joinpath(f))
-                else:
-                    mappedfiles.add(self.rootPath.joinpath(f))
+            for f in sorted(files, key=str.lower):
+                mappedfiles.update(self._resolveSourceFile(f, arch))
 
-            if arch and arch in self.catalogs:
-                mappedfiles = mappedfiles.union(self.catalogs[arch])
-            elif '' in self.catalogs:
-                mappedfiles = mappedfiles.union(self.catalogs[''])
+            # CopyINF=filename1.inf[,filename2.inf]... (DDInstall only)
+            for key, _, entry in self.sections[ddinstall]:
+                if key == "copyinf":
+                    for value in entry.rawValues:
+                        if value:
+                            mappedfiles.update(self._copyInfFiles(value, arch))
 
-            device = DriverTarget(hardwareId, name, self.date, self.version, list(mappedfiles))
+            catalog = self._catalogFor(arch)
+            if catalog:
+                mappedfiles.add(catalog)
+
+            device = DriverTarget(hardwareId, name, targetDate, targetVersion, mappedfiles)
+            device.InstallSection = ddinstall
+            device.Kind = kind
+            device.Models = models
             device.Architecture = arch
-            device.OSMajorVersion = int(osma) if osma else None
-            device.OSMinorVersion = int(osmi) if osmi else None
-            device.ProductType = product
-            device.SuiteMask = suite
-            device.BuildNumber = int(build) if build else None
+            device.OSMajorVersion = models.osMajor
+            device.OSMinorVersion = models.osMinor
+            device.ProductType = models.productType
+            device.SuiteMask = models.suiteMask
+            device.BuildNumber = models.build
             self.targets.append(device)
 
 
-    def _parseManufacturer(self, section:str = "manufacturer"):
-        if not section in self.sections: return
+    def _parseManufacturer(self):
         # https://learn.microsoft.com/windows-hardware/drivers/install/inf-manufacturer-section
-        for manufacturer, value, _ in self.sections[section]:
+        for entry in self.inf.entries("manufacturer"):
             # manufacturer-name |
             # %strkey%=models-section-name |
             # %strkey%=models-section-name [,TargetOSVersion] [,TargetOSVersion] ...  (Windows XP and later versions of Windows)
-            value = value.strip().lower()
-
-            if not value:
-                # manufacturer-identifier
-                self._parseManufacturer(manufacturer)
-                continue
-
-            modelSection = targets = None
-            if ',' not in value:
-                # TODO: add support for DOS kernel handling
-                # currently, an empty TargetOSVersion simply defaults to regular fallbacks being used
-                modelSection = value
-                targets = ['']
+            if entry.key is None:
+                # manufacturer-name: implicitly specifies the Models section of the same name
+                if not entry.values or not entry.values[0]:
+                    continue
+                if len(entry.values) > 1:
+                    print(f"warning: manufacturer-name entry {entry.values[0]} cannot have TargetOSVersion decorations (line {entry.line})")
+                modelSection, decorations = entry.values[0], []
             else:
-                values = [v.strip() for v in value.split(',')]
-                modelSection = values[0]
-                targets = values[1:]
+                if not entry.values or not entry.values[0]:
+                    print(f"warning: missing models section name in [Manufacturer] (line {entry.line})")
+                    continue
+                modelSection = entry.values[0]
+                decorations = [d for d in entry.values[1:] if d]
 
-            for TargetOSVersion in targets:
-                # Windows XP to Windows 10 v1511:
-                # NT[Architecture][.[OSMajorVersion][.[OSMinorVersion][.[ProductType][.SuiteMask]]]]
-                # since Windows 10 v1607 (build 14310):
-                # NT[Architecture][.[OSMajorVersion][.[OSMinorVersion][.[ProductType][.[SuiteMask][.[BuildNumber]]]]]
-                parts = []
-                if '.' in TargetOSVersion:
-                    parts = TargetOSVersion.split('.')
-                elif TargetOSVersion:
-                    parts = [TargetOSVersion]
+            listed: list[ModelsDecoration] = []
+            if not decorations:
+                # TODO: add support for DOS kernel handling
+                # An undecorated Models section is only used on x86 since Windows Server 2003 SP1,
+                # non-x86 platforms require the architecture decoration
+                listed.append(ModelsDecoration(modelSection, "", "x86"))
 
-                (arch, osma, osmi, product, suite, build) = parts + [None] * (6 - len(parts))
-                # not sure if the os specific e.g. [StdMfg.NTamd64] is automatically checked by windows 
-                # even though it is not part explictily mentioned for the model section
-                self._parseModelSection(modelSection, TargetOSVersion, (arch, osma, osmi, product, suite, build))
+            # Only the listed decorations are used: an undecorated Models section next to
+            # decorated ones only applies to Windows versions before Windows XP
+            for decoration in decorations:
+                target = parseTargetOSVersion(decoration)
+                if target is None:
+                    print(f"warning: invalid TargetOSVersion {decoration} for models section {modelSection} (line {entry.line})")
+                    continue
+                listed.append(ModelsDecoration(modelSection, decoration, *target))
+
+            for models in listed:
+                if any(m.sectionName().lower() == models.sectionName().lower() for m in self.models):
+                    continue
+                self.models.append(models)
+                self._parseModelSection(models)
 
 
     def _parseVersion(self):
-        # TODO: Implement support for "LayoutFile"
-        for key, value, _ in self.sections["version"]:
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-version-section
+        # LayoutFile is only used by system-supplied INFs (instead of SourceDisksNames/Files)
+        driverVer = None
+        for key, _, entry in self.sections["version"]:
+            value = entry.values[0] if entry.values else ""
             if key == "class":
                 self.klass = value
-            elif key.startswith("catalogfile"):
-                arch = key[key.find("catalogfile.") + 1:] if '.' in key else ''
-                if not arch in self.catalogs: self.catalogs[arch] = set()
-                self.catalogs[arch].add(self.rootPath.joinpath(value))
+            elif key == "provider":
+                self.provider = value
+            elif key == "catalogfile" or key.startswith("catalogfile."):
+                # CatalogFile[.nt|.ntx86|.ntamd64|...]=filename.cat, the catalog is
+                # located next to the INF and is not listed in SourceDisksFiles
+                decoration = key.split('.', 1)[1] if '.' in key else ''
+                if not value:
+                    print(f"warning: empty {entry.key} (line {entry.line})")
+                    continue
+                if '\\' in value or '/' in value:
+                    print(f"warning: {entry.key} must be a file name without path, got {value} (line {entry.line})")
+                if decoration in self.catalogFiles:
+                    print(f"warning: {entry.key} defined multiple times (line {entry.line})")
+                    continue
+                self.catalogFiles[decoration] = pathlib.PurePosixPath(pathlib.PureWindowsPath(value).name)
             elif key == "driverver":
-                # mm/dd/yyyy,w.x.y.z
-                dateValue = version = None
-                if not ',' in value:
-                    print(f"warning: version does not conform to spezification, mm/dd/yyyy,w.x.y.z expected, got {value}")
-                    dateValue = value
-                else:
-                    dateValue, version = value.split(',')
+                if driverVer is not None:
+                    print(f"warning: DriverVer defined multiple times (line {entry.line})")
+                    continue
+                driverVer = entry
 
-                dateValue = dateValue.strip() # note: strip should not be necessary for compliant files
-                if version:
-                    try:
-                        self.version = pkgver.Version(version)
-                    except:
-                        print("error: invalid version value: " + version)
+        if driverVer is None:
+            # Starting with Windows 2000, INF files must have a DriverVer directive;
+            # without it Windows applies the default date of 00/00/0000
+            print("warning: DriverVer missing in [Version]")
+        else:
+            self.date, self.version = self._parseDriverVer(driverVer)
 
-                try:
-                    if dateValue == "00/00/0000":
-                        self.date = None
-                    elif '/' in dateValue:
-                        self.date = datetime.strptime(dateValue, "%m/%d/%Y").date()
-                    elif '-' in dateValue:
-                        self.date = datetime.strptime(dateValue, "%m-%d-%Y").date()
-                    else:
-                        print("warning: unknown date format: " + dateValue)
-                except ValueError:
-                    print("error: invalid date value: " + dateValue)
+
+    def _parseDriverVer(self, entry: infparser.Entry) -> tuple[date | None, pkgver.Version | None]:
+        # https://learn.microsoft.com/windows-hardware/drivers/install/inf-driverver-directive
+        # DriverVer=mm/dd/yyyy[,w.x.y.z]; a hyphen can be used as the date separator,
+        # an invalid date is treated as 00/00/0000
+        dateValue = entry.values[0].strip() if entry.values else ""
+        versionValue = entry.values[1].strip() if len(entry.values) > 1 else ""
+        if len(entry.values) > 2:
+            print(f"warning: DriverVer has extra values, expected mm/dd/yyyy,w.x.y.z (line {entry.line})")
+
+        driverDate = None
+        if dateValue and dateValue not in ("00/00/0000", "00-00-0000"):
+            try:
+                driverDate = datetime.strptime(dateValue.replace('-', '/'), "%m/%d/%Y").date()
+            except ValueError:
+                print(f"error: invalid DriverVer date {dateValue}, expected mm/dd/yyyy (line {entry.line})")
+
+        driverVersion = None
+        if versionValue:
+            # each of w, x, y and z must be an integer >= 0 and < 65535, 0.0.0.0 is not valid
+            parts = versionValue.split('.')
+            if len(parts) > 4 or not all(p.isdigit() and int(p) < 65535 for p in parts):
+                print(f"error: invalid DriverVer version {versionValue}, expected w.x.y.z (line {entry.line})")
+            elif all(int(p) == 0 for p in parts):
+                print(f"error: invalid DriverVer version {versionValue}, 0.0.0.0 is not valid (line {entry.line})")
+            else:
+                driverVersion = pkgver.Version(versionValue)
+
+        return driverDate, driverVersion
+
+
+    @property
+    def signed(self) -> bool:
+        # without a CatalogFile entry the driver package is treated as unsigned
+        return bool(self.catalogFiles)
+
+
+    def _catalogFor(self, arch: str | None) -> pathlib.Path | None:
+        # CatalogFile.nt<arch> -> CatalogFile.nt -> CatalogFile
+        for decoration in ([f"nt{arch}"] if arch else []) + ["nt", ""]:
+            if decoration in self.catalogFiles:
+                catalog = self._locate(self.catalogFiles[decoration])
+                if catalog is None and ("catalog", decoration) not in self.resolvedFiles:
+                    self.resolvedFiles[("catalog", decoration)] = set()
+                    print(f"error: catalog file {self.catalogFiles[decoration]} not found next to the INF")
+                return catalog
+        return None
+
+SCHEMA_VERSION = 2
+SCHEMA = """
+    CREATE TABLE driver (
+        id INTEGER PRIMARY KEY,
+        -- sha256 of the INF: identifies the package, store folder is store/<sha256[:16]>
+        sha256 TEXT NOT NULL,
+        -- '' for stored packages, the WIM guid for built-in drivers (coverage only, no files)
+        container TEXT NOT NULL DEFAULT '',
+        -- package folder, relative to the database directory if it is inside of it
+        root TEXT NOT NULL,
+        -- INF path relative to root
+        inf TEXT NOT NULL,
+        class TEXT,
+        provider TEXT,
+        signed INTEGER NOT NULL,
+        -- DriverVer of the [Version] section, date as YYYY-MM-DD
+        date TEXT,
+        version TEXT,
+        UNIQUE (sha256, container)
+    );
+
+    -- WIM images scanned for built-in drivers, driver.container is their guid
+    CREATE TABLE container (
+        guid TEXT PRIMARY KEY,
+        path TEXT,
+        image INTEGER,
+        arch TEXT,
+        os_major INTEGER,
+        os_minor INTEGER,
+        os_build INTEGER,
+        -- VER_NT_WORKSTATION (1), VER_NT_DOMAIN_CONTROLLER (2), VER_NT_SERVER (3)
+        product_type INTEGER
+    );
+
+    -- every Models section listed in [Manufacturer], also empty or missing ones (they exclude a target OS)
+    CREATE TABLE models (
+        id INTEGER PRIMARY KEY,
+        driver INTEGER NOT NULL REFERENCES driver(id) ON DELETE CASCADE,
+        -- undecorated Models section name (lower case), one per manufacturer entry
+        section TEXT NOT NULL,
+        -- TargetOSVersion as listed ('' for an undecorated entry)
+        decoration TEXT NOT NULL,
+        arch TEXT NOT NULL,
+        os_major INTEGER,
+        os_minor INTEGER,
+        os_product_type INTEGER,
+        os_suite_mask INTEGER,
+        os_build INTEGER
+    );
+
+    CREATE TABLE fileset (
+        id INTEGER PRIMARY KEY,
+        driver INTEGER NOT NULL REFERENCES driver(id) ON DELETE CASCADE,
+        arch TEXT NOT NULL
+    );
+
+    CREATE TABLE fileset_file (
+        fileset INTEGER NOT NULL REFERENCES fileset(id) ON DELETE CASCADE,
+        -- relative to driver.root
+        path TEXT NOT NULL,
+        size INTEGER,
+        PRIMARY KEY (fileset, path)
+    );
+
+    CREATE TABLE target (
+        id INTEGER PRIMARY KEY,
+        driver INTEGER NOT NULL REFERENCES driver(id) ON DELETE CASCADE,
+        -- NULL for built-in drivers of a WIM
+        fileset INTEGER REFERENCES fileset(id) ON DELETE CASCADE,
+        -- the Models section listing this target (its target OS decoration)
+        models INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+        hwid TEXT NOT NULL COLLATE NOCASE,
+        -- 'hardware' or 'compatible'
+        kind TEXT NOT NULL,
+        name TEXT,
+        install_section TEXT,
+        -- same as models.arch, for lookups by hardware id and architecture
+        arch TEXT NOT NULL,
+        -- DriverVer of the DDInstall section (or [Version]), date as YYYY-MM-DD
+        date TEXT,
+        v_major INTEGER,
+        v_minor INTEGER,
+        v_patch INTEGER,
+        v_build INTEGER
+    );
+
+    CREATE INDEX target_lookup ON target(hwid, arch);
+    CREATE INDEX target_driver ON target(driver);
+    CREATE INDEX fileset_driver ON fileset(driver);
+    CREATE INDEX models_driver ON models(driver);
+"""
+
+
+def versionParts(version: pkgver.Version | None) -> tuple[int | None, int | None, int | None, int | None]:
+    # DriverVer versions have four parts (w.x.y.z), missing parts are 0
+    if version is None:
+        return (None, None, None, None)
+    w, x, y, z = (version.release + (0, 0, 0, 0))[:4]
+    return (w, x, y, z)
+
 
 class DriverDatabase:
     db_path: str
+    conn: sqlite3.Connection
 
     def __init__(self, db_path: str):
         self.db_path = db_path
 
     def __enter__(self):
         self.conn = sqlite3.connect(self.db_path)
-        # CRITICAL: SQLite requires this pragma to respect ON DELETE CASCADE
-        self.conn.execute("PRAGMA foreign_keys = ON;")
         self._create_tables()
+        # CRITICAL: SQLite requires this pragma to respect ON DELETE CASCADE
+        self.conn.execute("PRAGMA foreign_keys = ON")
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
 
     def _create_tables(self):
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS driver (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    root TEXT NOT NULL,
-                    inf TEXT NOT NULL,
-                    container TEXT
-                )""")
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            return
 
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS target (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    driver INTEGER NOT NULL,
-                    root TEXT NOT NULL,
-                    hwid TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    arch TEXT,
-                    os_major INTEGER,
-                    os_minor INTEGER,
-                    os_build INTEGER,
-                    date INTEGER,
-                    v_major INTEGER,
-                    v_minor INTEGER,
-                    v_patch INTEGER,
-                    v_build INTEGER,
-                    FOREIGN KEY (driver) REFERENCES driver(id) ON DELETE CASCADE
-                )""")
-
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS file (
-                    target INTEGER NOT NULL,
-                    path TEXT NOT NULL,
-                    FOREIGN KEY (target) REFERENCES target(id) ON DELETE CASCADE
-                )""")
-
-            self.conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_target_lookup 
-                ON target(hwid, arch, os_major, os_minor, os_build)
-            ''')
-
-    def addDriver(self, id: int | None, root: str, inf: str, container: str | None) -> int | None:
-        with self.conn:
-            if id:
-                self.conn.execute("INSERT OR IGNORE INTO driver (id, root, inf, container) VALUES (?, ?, ?, ?)", (id, root, inf, container if container else ""))
-            else:
-                cursor = self.conn.execute("INSERT INTO driver (root, inf, container) VALUES (?, ?, ?)", (root, inf, container if container else ""))
-                id = cursor.lastrowid
-
-            return id
+        tables = [row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+        if tables:
+            # there is no migration, the drivers have to be scanned again
+            print(f"warning: database schema version {version} is outdated, recreating {self.db_path} (all drivers have to be scanned again)")
+        script = "".join(f"DROP TABLE IF EXISTS {table};\n" for table in tables)
+        self.conn.executescript(f"BEGIN; {script} {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;")
 
     def removeContainer(self, container: str):
         if container:
-            with self.conn:
-                self.conn.execute("DELETE FROM driver WHERE container=?", (container,))
+            self.conn.execute("DELETE FROM driver WHERE container = ?", (container,))
+            self.conn.execute("DELETE FROM container WHERE guid = ?", (container,))
 
-    def removeDriver(self, root: str, inf: str, container: str):
-        with self.conn:
-            cursor = self.conn.execute(
-                "DELETE FROM driver WHERE root = ? AND inf = ? AND container = ? RETURNING id",
-                (root, inf, container)
-            )
-            res = cursor.fetchall()
-            if res: return res[0][0]
+    def addContainer(self, wim: "WimImage"):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO container (guid, path, image, arch, os_major, os_minor, os_build, product_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (wim.guid, wim.path, wim.image, wim.arch, wim.osMajor, wim.osMinor, wim.osBuild, wim.productType))
 
-    def addTarget(self, driver: int, root: str, hwid: str, name: str, arch: str | None, os_major: int | None, os_minor: int | None, os_build: int | None, date: date | None, version: pkgver.Version | None) -> int | None:
-        # DriverVer versions have four parts (w.x.y.z), missing parts are 0
-        v_major, v_minor, v_patch, v_build = (version.release + (0, 0, 0, 0))[:4] if version else (None, None, None, None)
-        timestamp = datetime.combine(date, datetime.min.time()).timestamp() if date else None
-        with self.conn:
-            cursor = self.conn.execute("""
-                INSERT INTO target (driver, root, hwid, name, arch, os_major, os_minor, os_build, date, v_major, v_minor, v_patch, v_build)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (driver, root, hwid, name, arch, os_major, os_minor, os_build, timestamp, v_major, v_minor, v_patch, v_build))
-            return cursor.lastrowid
+    def addModels(self, driver: int, models: ModelsDecoration) -> int | None:
+        cursor = self.conn.execute("""
+            INSERT INTO models (driver, section, decoration, arch, os_major, os_minor, os_product_type, os_suite_mask, os_build)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (driver, models.section.lower(), models.decoration, models.arch, models.osMajor, models.osMinor,
+             models.productType, models.suiteMask, models.build))
+        return cursor.lastrowid
 
-    def addFile(self, target: int, path: str) -> int | None:
-        with self.conn:
-            cursor = self.conn.execute(
-                "INSERT INTO file (target, path) VALUES (?, ?)", 
-                (target, path)
-            )
-            return cursor.lastrowid
+    def removeDriver(self, sha256: str, container: str):
+        self.conn.execute("DELETE FROM driver WHERE sha256 = ? AND container = ?", (sha256, container))
+
+    def addDriver(self, driver: "DriverFile", root: str, inf: str, container: str) -> int | None:
+        cursor = self.conn.execute("""
+            INSERT INTO driver (sha256, container, root, inf, class, provider, signed, date, version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (driver.sha256, container, root, inf, driver.klass, driver.provider, int(driver.signed),
+             driver.date.isoformat() if driver.date else None, str(driver.version) if driver.version else None))
+        return cursor.lastrowid
+
+    def addFileset(self, driver: int, arch: str, files: list[tuple[str, int | None]]) -> int | None:
+        cursor = self.conn.execute("INSERT INTO fileset (driver, arch) VALUES (?, ?)", (driver, arch))
+        self.conn.executemany("INSERT INTO fileset_file (fileset, path, size) VALUES (?, ?, ?)",
+                              [(cursor.lastrowid, path, size) for path, size in files])
+        return cursor.lastrowid
+
+    def addTarget(self, driver: int, fileset: int | None, models: int, target: DriverTarget) -> int | None:
+        cursor = self.conn.execute("""
+            INSERT INTO target (driver, fileset, models, hwid, kind, name, install_section, arch,
+                                date, v_major, v_minor, v_patch, v_build)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (driver, fileset, models, target.HardwareID, target.Kind, target.DeviceDescription, target.InstallSection,
+             target.Architecture, target.date.isoformat() if target.date else None, *versionParts(target.version)))
+        return cursor.lastrowid
 
     def close(self):
         self.conn.close()
+
+
+# WINDOWS/ARCH of the WIM XML metadata (PROCESSOR_ARCHITECTURE_*)
+WIM_ARCHITECTURES = {0: "x86", 5: "arm", 6: "ia64", 9: "amd64", 12: "arm64"}
+# WINDOWS/PRODUCTTYPE of the WIM XML metadata (VER_NT_*)
+WIM_PRODUCT_TYPES = {"winnt": 1, "lanmannt": 2, "servernt": 3}
+
+
+class WimImage:
+    """GUID and Windows version of a WIM image (wimlib-imagex info)."""
+    path: str
+    image: int
+    guid: str
+    arch: str | None
+    osMajor: int | None
+    osMinor: int | None
+    osBuild: int | None
+    productType: int | None
+
+    def __init__(self, path: str, image: int):
+        self.path = path
+        self.image = image
+        self.guid = ""
+        self.arch = None
+        self.osMajor = self.osMinor = self.osBuild = self.productType = None
+
+        for line in subprocess.run(["wimlib-imagex", "info", path, "--header"], capture_output=True).stdout.splitlines():
+            line = line.decode("utf-8").strip()
+            if line.lower().startswith("guid"):
+                self.guid = line[line.find("=") + 1:].strip().lower()
+                break
+
+        data = subprocess.run(["wimlib-imagex", "info", path, "--xml"], capture_output=True).stdout
+        if not data:
+            return
+        # the XML metadata is UTF-16 LE with a byte order mark
+        root = ElementTree.fromstring(data.decode("utf-16") if data[:2] in (b"\xff\xfe", b"\xfe\xff") else data.decode("utf-8"))
+        windows = root.find(f"IMAGE[@INDEX='{image}']/WINDOWS")
+        if windows is None:
+            return
+
+        def number(tag: str) -> int | None:
+            value = windows.findtext(tag)
+            return int(value) if value and value.strip().isdigit() else None
+
+        arch = number("ARCH")
+        self.arch = WIM_ARCHITECTURES.get(arch) if arch is not None else None
+        self.osMajor, self.osMinor, self.osBuild = number("VERSION/MAJOR"), number("VERSION/MINOR"), number("VERSION/BUILD")
+        self.productType = WIM_PRODUCT_TYPES.get((windows.findtext("PRODUCTTYPE") or "").strip().lower())
+
+
+def extractWimInfs(path: str, image: int, destination: str) -> list[pathlib.Path]:
+    """
+    Previously infs were extracted from WIMs using wimdir and a subsequent wiminfo which was slow
+    but didn't require a temporary directory.
+    It took several minutes for a WIM though and using a in-memory filesystem instead speeds
+    up the process significantly and outweights the benefit of not having to cleanup a temporary directory.
+    """
+    env = os.environ.copy()
+    env["WIMLIB_IMAGEX_IGNORE_CASE"] = "1"
+    result = subprocess.run(["wimextract", path, str(image), "/Windows/INF/*.inf", f"--dest-dir={destination}", "--no-acls", "--nullglob"],
+                            capture_output=True, env=env)
+    if result.returncode != 0:
+        print(f"error: extracting the INF files of {path} (image {image}) failed: {result.stderr.decode(errors='replace').strip()}")
+        return []
+    return sorted(p for p in pathlib.Path(destination).iterdir() if p.is_file() and p.suffix.lower() == ".inf")
+
+
+def relativeTo(path: pathlib.Path, base: pathlib.Path) -> str:
+    """path relative to base if it is inside of it, otherwise the absolute path"""
+    path, base = path.absolute(), base.absolute()
+    return path.relative_to(base).as_posix() if path.is_relative_to(base) else str(path)
+
+
+def storePackage(driver: DriverFile, files: set[str], storeDir: pathlib.Path) -> pathlib.Path:
+    """
+    Copies the files (relative to the INF directory) into <storeDir>/<sha256[:16]>, keeping the
+    layout of the package. The folder is content addressed: re-storing a package is a no-op and
+    different versions of a driver never overwrite each other.
+    """
+    destination = storeDir.joinpath(driver.sha256[:16])
+    for relative in sorted(files):
+        source = driver.rootPath.joinpath(relative)
+        target = destination.joinpath(relative)
+        if target.is_file() and target.stat().st_size == source.stat().st_size:
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return destination
+
+
+def importDriver(db: DriverDatabase, driver: DriverFile, container: str, wim: bool, store: pathlib.Path | None, filesetScope: str):
+    dbDir = pathlib.Path(db.db_path).absolute().parent
+
+    # files of each target relative to the package root (the INF directory)
+    targetFiles: dict[int, frozenset[str]] = {}
+    if not wim:
+        for index, t in enumerate(driver.targets):
+            relative: set[str] = set()
+            for f in t.files:
+                if f.absolute().is_relative_to(driver.rootPath.absolute()):
+                    relative.add(f.absolute().relative_to(driver.rootPath.absolute()).as_posix())
+                else:
+                    print(f"error: {f} is outside of the driver package {driver.rootPath}")
+            targetFiles[index] = frozenset(relative)
+
+    root = driver.rootPath
+    if store and not wim:
+        root = storePackage(driver, set().union(*targetFiles.values()), store)
+    rootValue = str(root) if wim else relativeTo(root, dbDir)
+
+    with db.conn:
+        db.removeDriver(driver.sha256, container)
+        driverId = db.addDriver(driver, rootValue, driver.infPath.name, container)
+        if driverId is None:
+            raise RuntimeError(f"failed to add driver {driver.infPath}")
+
+        modelsIds = {id(models): db.addModels(driverId, models) for models in driver.models}
+
+        # file sets are shared by all targets with the same files (per architecture)
+        filesets: dict[tuple[str, frozenset[str]], int | None] = {}
+        if filesetScope == "arch":
+            union: dict[str, set[str]] = {}
+            for index, t in enumerate(driver.targets):
+                union.setdefault(t.Architecture or "", set()).update(targetFiles.get(index, ()))
+            targetFiles = {index: frozenset(union[t.Architecture or ""]) for index, t in enumerate(driver.targets)} if not wim else {}
+
+        for index, t in enumerate(driver.targets):
+            filesetId = None
+            if index in targetFiles:
+                key = (t.Architecture or "", targetFiles[index])
+                if key not in filesets:
+                    sizes = [(f, root.joinpath(f).stat().st_size if root.joinpath(f).is_file() else None) for f in sorted(key[1])]
+                    filesets[key] = db.addFileset(driverId, key[0], sizes)
+                filesetId = filesets[key]
+            modelsId = modelsIds[id(t.Models)]
+            if modelsId is None:
+                raise RuntimeError(f"failed to add models section {t.Models.sectionName()}")
+            db.addTarget(driverId, filesetId, modelsId, t)
 
 
 if __name__ == "__main__":
@@ -550,7 +1143,27 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--store",
-        help="copy driver files to the given folder"
+        action="store_true",
+        help="copy the minimal driver package (all files required by its targets) to <store-dir>/<sha256 of the INF>"
+    )
+
+    parser.add_argument(
+        "--store-dir",
+        help="store directory (default: 'store' next to the database)"
+    )
+
+    parser.add_argument(
+        "--fileset-scope",
+        choices=["section", "arch"],
+        default="section",
+        help="files of a target: those of its install section, or all files of the driver for the architecture (default: %(default)s)"
+    )
+
+    parser.add_argument(
+        "--wim-image",
+        type=int,
+        default=1,
+        help="image index of WIM files (default: %(default)s)"
     )
 
     parser.add_argument(
@@ -567,73 +1180,58 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    classFilter = {c.lower() for c in args.class_filter} if args.class_filter else None
+    storeDir = None
+    if args.store:
+        storeDir = pathlib.Path(args.store_dir) if args.store_dir else pathlib.Path(args.database).absolute().parent.joinpath("store")
+
+    def scanInf(db: DriverDatabase, path: str, container: str, data: bytes | None = None):
+        driver = DriverFile(path, data=data)
+        if not driver.valid:
+            return
+
+        # class names are case-insensitive
+        if classFilter and driver.klass.lower() not in classFilter:
+            return
+
+        driver.parseDevices()
+        if len(driver.targets) == 0:
+            with db.conn:
+                db.removeDriver(driver.sha256, container)
+            print(path + " - no hardware ids contained - ignoring")
+            return
+
+        print("processing: " + path)
+        # we do not store files of built-in drivers as the use-case for wim-parsing
+        # is to check if driver for a device is built-in and not to download those
+        # files (also, drivers are not stored in /Windows/INF but in
+        # /Windows/System32/DriverStore which requires a different parsing strategy)
+        importDriver(db, driver, container, data is not None, storeDir, args.fileset_scope)
+
     with DriverDatabase(args.database) as db:
-        env = os.environ.copy()
-        env["WIMLIB_IMAGEX_IGNORE_CASE"] = "1"
-
+        tempDir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
         for path in args.files:
-            _, ext = os.path.splitext(path)
-            ext = ext.lower()
+            container = args.container or ""
+            if os.path.splitext(path)[1].lower() != ".wim":
+                scanInf(db, path, container)
+                continue
 
-            files: list[str] = []
-            container = args.container
-            wim = None
-            if ext == ".wim":
-                image = 1
-                wim = (path, image)
-                print(f"processing: {path} (image={image})")
-                for file in subprocess.run(["wimdir", path, str(image), "--path=/Windows/INF"], capture_output=True, env=env).stdout.splitlines():
-                    file = file.decode("utf-8")
-                    if file.lower().endswith(".inf"): files.append(file)
+            image = args.wim_image
+            print(f"processing: {path} (image={image})")
+            wimImage = WimImage(path, image)
+            container = container or wimImage.guid
+            if not container:
+                print(f"error: could not read the GUID of {path}")
+                continue
+            wimImage.guid = container
+            if not wimImage.arch:
+                print(f"warning: could not read the architecture and version of image {image} of {path}")
+            # drivers removed from the image must not remain in the database
+            with db.conn:
+                db.removeContainer(container)
+                db.addContainer(wimImage)
 
-                if not container:
-                    for line in subprocess.run(["wimlib-imagex", "info", path, "--header"], capture_output=True).stdout.splitlines():
-                        line = line.decode("utf-8").lstrip().lower()
-                        if line.startswith("guid"):
-                            container = line[line.find("=") + 1:].strip()
-                            break
-            else:
-                files.append(path)
-
-            for file in files:
-                driver = DriverFile(file, wim=wim)
-                if not driver.valid: continue
-
-                if args.class_filter and driver.klass not in args.class_filter:
-                    continue
-
-                driver.parseDevices()
-
-                # only now the infPath and rootPath are now accurate
-                drvid = db.removeDriver(str(driver.rootPath), str(driver.infPath), container if container else "")
-                if len(driver.targets) == 0:
-                    print(file + " - no hardware ids contained - ignoring")
-                    continue
-
-                print("processing: " + file)
-                rootPath = str(driver.rootPath)
-                if args.store and not wim:
-                    rootPath = os.path.join('store', args.store)
-                    os.makedirs(rootPath, exist_ok=True)
-
-                drvid = db.addDriver(drvid, rootPath, str(driver.infPath), container)
-                if not drvid:
-                    print(f"error: failed to add driver {file}")
-                    continue
-
-                for d in driver.targets:
-                    tid = db.addTarget(drvid, str(d.root), d.HardwareID, d.DeviceDescription, d.Architecture, d.OSMajorVersion, d.OSMinorVersion, d.BuildNumber, d.date, d.version)
-                    if not tid:
-                        print(f"error: failed to add target {d.HardwareID} for {file}")
-                        continue
-
-                    if not wim:
-                        # we do not store built-in drivers as the use-case for wim-parsing
-                        # is to check if driver for a device is built-in and not
-                        # to download those files (also, drivers are not store in /Windows/INF
-                        # but in /Windows/System32/DriverStore which requires a different 
-                        # parsing strategy)
-                        for fpath in d.files:
-                            db.addFile(tid, str(fpath))
-                            if args.store:
-                                shutil.copy(driver.rootPath.joinpath(fpath), os.path.join('store', args.store, fpath))
+            # the INF files are only needed while scanning, keep them in memory where possible
+            with tempfile.TemporaryDirectory(prefix="windrv-", dir=tempDir) as tmp:
+                for inf in extractWimInfs(path, image, tmp):
+                    scanInf(db, f"/Windows/INF/{inf.name}", container, inf.read_bytes())
