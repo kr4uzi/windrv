@@ -4,10 +4,14 @@ import shutil
 import subprocess
 import tempfile
 import argparse
+import contextlib
 import hashlib
+import io
+import json
 import pathlib
 import infparser
 import sqlite3
+import sys
 from xml.etree import ElementTree
 from packaging import version as pkgver
 from datetime import date, datetime
@@ -48,6 +52,48 @@ def parseTargetOSVersion(decoration: str) -> tuple[str, int | None, int | None, 
 
     return (arch, int(major) if major else None, int(minor) if minor else None,
             productType or None, suiteMask or None, int(build) if build else None)
+
+
+class Manifest:
+    """
+    Files of a driver package that are not (yet) available locally, e.g. an upload of which only the
+    INF files were transferred: paths relative to root with their sizes. DriverFile resolves files
+    against the manifest instead of the file system.
+    """
+    root: pathlib.Path
+    sizes: dict[pathlib.Path, int | None]
+    # directory -> {lowercased name: name}
+    listings: dict[pathlib.Path, dict[str, str]]
+
+    def __init__(self, root: pathlib.Path, files: list[tuple[str, int | None]]):
+        self.root = root.absolute()
+        self.sizes = {}
+        self.listings = {}
+        for relative, size in files:
+            parts = pathlib.PurePosixPath(relative).parts
+            if not parts or ".." in parts or pathlib.PurePosixPath(relative).is_absolute():
+                continue
+            current = self.root
+            for part in parts:
+                self.listings.setdefault(current, {})[part.lower()] = part
+                current = current.joinpath(part)
+            self.sizes[current] = size
+
+    @classmethod
+    def load(cls, path: str, root: str | None = None) -> "Manifest":
+        # JSON list of {"path": "relative/path", "size": 123}, root defaults to the manifest's directory
+        entries = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        return cls(pathlib.Path(root) if root else pathlib.Path(path).parent,
+                   [(e["path"], e.get("size")) for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)])
+
+    def listing(self, directory: pathlib.Path) -> dict[str, str]:
+        return self.listings.get(directory.absolute(), {})
+
+    def isFile(self, path: pathlib.Path) -> bool:
+        return path.absolute() in self.sizes
+
+    def relative(self, path: pathlib.Path) -> str:
+        return path.absolute().relative_to(self.root).as_posix()
 
 
 class SourceDisk:
@@ -203,10 +249,14 @@ class DriverFile:
     copyInfPaths: dict[str, pathlib.Path | None]
     # files are not available locally (built-in drivers from a WIM image)
     wim: bool
+    # files resolved against a manifest instead of the file system (e.g. an upload in progress)
+    manifest: Manifest | None
+    # files referenced by the INF that are not part of the driver package (INF directory + relative path)
+    missing: set[pathlib.Path]
     # key to value mapping for string replacement (e.g. %strkey% in the model section)
     strings: dict[str, str]
 
-    def __init__(self, path: str, data: bytes | None = None, visited: set[str] | None = None):
+    def __init__(self, path: str, data: bytes | None = None, visited: set[str] | None = None, manifest: Manifest | None = None):
         """
         path: the INF file; for built-in drivers of a WIM image its path inside the image, with its
         content passed as data (the files of the driver package are not available then)
@@ -227,6 +277,8 @@ class DriverFile:
         self.resolvedFiles = {}
         self.directoryListings = {}
         self.wim = data is not None
+        self.manifest = manifest
+        self.missing = set()
         self.visited = visited if visited is not None else set()
         self.visited.add(str(self.infPath.resolve()) if not self.wim else path)
         self.copyInfs = {}
@@ -365,15 +417,21 @@ class DriverFile:
         # file name on case-sensitive and case-insensitive file systems alike
         current = self.rootPath
         for part in relative.parts:
-            if current not in self.directoryListings:
-                try:
-                    self.directoryListings[current] = {name.lower(): name for name in os.listdir(current)}
-                except OSError:
-                    self.directoryListings[current] = {}
-            match = self.directoryListings[current].get(part.lower())
+            if self.manifest is not None:
+                listing = self.manifest.listing(current)
+            else:
+                if current not in self.directoryListings:
+                    try:
+                        self.directoryListings[current] = {name.lower(): name for name in os.listdir(current)}
+                    except OSError:
+                        self.directoryListings[current] = {}
+                listing = self.directoryListings[current]
+            match = listing.get(part.lower())
             if match is None:
                 return None
             current = current.joinpath(match)
+        if self.manifest is not None:
+            return current if self.manifest.isFile(current) else None
         return current if current.is_file() else None
 
 
@@ -409,6 +467,7 @@ class DriverFile:
             path = self._locate(disk.path.joinpath(disk.cabFile() or ""))
         if path is None:
             print(f"error: {relative} not found in the driver package ({arch})")
+            self.missing.add(self.rootPath.joinpath(relative))
         else:
             resolved.add(path)
 
@@ -439,6 +498,7 @@ class DriverFile:
                 path = self._locate(relative)
                 if path is None:
                     print(f"error: CopyINF {relative} not found in the driver package")
+                    self.missing.add(self.rootPath.joinpath(relative))
             self.copyInfPaths[value.lower()] = path
 
         if path is None:
@@ -452,9 +512,10 @@ class DriverFile:
                 # already part of this scan (e.g. INFs referencing each other)
                 self.copyInfs[key] = None
             else:
-                child = DriverFile(str(path), visited=self.visited)
+                child = DriverFile(str(path), visited=self.visited, manifest=self.manifest)
                 if child.valid:
                     child.parseDevices()
+                    self.missing.update(child.missing)
                 self.copyInfs[key] = child if child.valid else None
 
         files = {path}
@@ -803,6 +864,7 @@ class DriverFile:
                 if catalog is None and ("catalog", decoration) not in self.resolvedFiles:
                     self.resolvedFiles[("catalog", decoration)] = set()
                     print(f"error: catalog file {self.catalogFiles[decoration]} not found next to the INF")
+                    self.missing.add(self.rootPath.joinpath(self.catalogFiles[decoration]))
                 return catalog
         return None
 
@@ -1074,6 +1136,65 @@ def storePackage(driver: DriverFile, files: set[str], storeDir: pathlib.Path) ->
     return destination
 
 
+def planUpload(infs: list[str], manifest: Manifest, classFilter: set[str] | None) -> dict:
+    """
+    Which files of an upload are required: the INF files are available locally, all other files are
+    only known by the manifest. Returns the drivers with their required and missing files (relative
+    to the manifest root) and the scanner messages, nothing is written to the database.
+    """
+    def relative(paths) -> list[str]:
+        return sorted({manifest.relative(p) for p in paths if p.absolute().is_relative_to(manifest.root)})
+
+    drivers = []
+    required: set[str] = set()
+    missing: set[str] = set()
+    for path in infs:
+        out = io.StringIO()
+        skipped = None
+        with contextlib.redirect_stdout(out):
+            driver = DriverFile(path, manifest=manifest)
+            if not driver.valid:
+                skipped = "not a valid INF file"
+            elif classFilter and driver.klass.lower() not in classFilter:
+                skipped = f"class {driver.klass or '(none)'} is filtered"
+            else:
+                driver.parseDevices()
+                if not driver.targets:
+                    skipped = "no hardware ids"
+
+        entry = {
+            "inf": manifest.relative(pathlib.Path(path)),
+            "class": driver.klass,
+            "provider": driver.provider,
+            "version": str(driver.version) if driver.version else None,
+            "date": driver.date.isoformat() if driver.date else None,
+            "signed": driver.signed,
+            "skipped": skipped,
+            "messages": out.getvalue().splitlines(),
+        }
+        if skipped is None:
+            files = relative(f for t in driver.targets for f in t.files)
+            driverMissing = relative(driver.missing)
+            entry.update({
+                "targets": len(driver.targets),
+                "hardwareIds": len({t.HardwareID for t in driver.targets}),
+                "architectures": sorted({t.Architecture or "" for t in driver.targets}),
+                "files": files,
+                "missing": driverMissing,
+                "size": sum(manifest.sizes.get(manifest.root.joinpath(f)) or 0 for f in files),
+            })
+            required.update(files)
+            missing.update(driverMissing)
+        drivers.append(entry)
+
+    return {
+        "drivers": drivers,
+        "required": sorted(required),
+        "missing": sorted(missing),
+        "size": sum(manifest.sizes.get(manifest.root.joinpath(f)) or 0 for f in required),
+    }
+
+
 def importDriver(db: DriverDatabase, driver: DriverFile, container: str, wim: bool, store: pathlib.Path | None, filesetScope: str):
     dbDir = pathlib.Path(db.db_path).absolute().parent
 
@@ -1173,13 +1294,42 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="print which files of the driver packages are required as JSON (no database changes), "
+             "files are resolved against --manifest"
+    )
+
+    parser.add_argument(
+        "--manifest",
+        help="JSON list of {\"path\": ..., \"size\": ...} of the driver package files for --plan"
+    )
+
+    parser.add_argument(
+        "--manifest-root",
+        help="directory the manifest paths are relative to (default: the manifest's directory)"
+    )
+
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="create the database (or recreate an outdated one) and exit"
+    )
+
+    parser.add_argument(
         "files", 
         help="One or more Windows INF or WIM files (for built-in scans) to parse",
-        nargs="+",
+        nargs="*",
         metavar="filepath"
     )
 
     args = parser.parse_args()
+    if args.init:
+        with DriverDatabase(args.database):
+            print(f"database {args.database} (schema version {SCHEMA_VERSION}) is ready")
+        sys.exit(0)
+    if not args.files:
+        parser.error("the following arguments are required: filepath")
     classFilter = {c.lower() for c in args.class_filter} if args.class_filter else None
     storeDir = None
     if args.store:
@@ -1207,6 +1357,12 @@ if __name__ == "__main__":
         # files (also, drivers are not stored in /Windows/INF but in
         # /Windows/System32/DriverStore which requires a different parsing strategy)
         importDriver(db, driver, container, data is not None, storeDir, args.fileset_scope)
+
+    if args.plan:
+        if not args.manifest:
+            parser.error("--plan requires --manifest")
+        print(json.dumps(planUpload(args.files, Manifest.load(args.manifest, args.manifest_root), classFilter), indent=2))
+        sys.exit(0)
 
     with DriverDatabase(args.database) as db:
         tempDir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None

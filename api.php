@@ -21,6 +21,8 @@ function respond(array $data, int $status = 200): never
 
 try {
     $db = windrvOpenDb($config);
+} catch (WindrvDatabaseMissing $e) {
+    respond(['error' => $e->getMessage()], 503);
 } catch (Exception $e) {
     respond(['error' => "database connection failed: " . $e->getMessage()], 500);
 }

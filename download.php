@@ -10,7 +10,7 @@ $config = require 'config.php';
 try {
     $db = windrvOpenDb($config);
 } catch (Exception $e) {
-    die("Database connection failed. {$e}");
+    die("Database connection failed: " . $e->getMessage());
 }
 
 $stmt = $db->prepare(<<<SQL
@@ -32,7 +32,7 @@ if ($target['fileset'] === null) {
 // driver.root is relative to the database directory unless it is absolute
 $root = $target['root'];
 if (!str_starts_with($root, '/')) {
-    $root = dirname($config["db"]) . DIRECTORY_SEPARATOR . $root;
+    $root = dirname(windrvDbPath($config)) . DIRECTORY_SEPARATOR . $root;
 }
 $root = realpath($root);
 if (!$root) {

@@ -4,6 +4,55 @@ $config = require 'config.php';
 
 try {
     $db = windrvOpenDb($config);
+} catch (WindrvDatabaseMissing $e) {
+    // the database is created by windrvscan.py, offer to do that (or show the command)
+    $error = $output = null;
+    if (($_GET['action'] ?? '') === 'init' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        [$code, $stdout, $stderr] = windrvScan($config, ["--database=" . windrvDbPath($config), "--init"]);
+        if ($code === 0) {
+            header('Location: index.php', true, 303);
+            exit;
+        }
+        $error = "windrvscan.py --init failed (exit code {$code})";
+        $output = trim($stdout . "\n" . $stderr);
+    }
+    $path = htmlspecialchars(windrvDbPath($config));
+    $init = htmlspecialchars(windrvScanCommand($config, ["--init"]));
+    $scan = htmlspecialchars(windrvScanCommand($config, ["--class-filter=Net", "/path/to/boot.wim"]));
+    $failure = $error ? '<div class="error">' . htmlspecialchars($error) . '<pre>' . htmlspecialchars($output) . '</pre></div>' : '';
+    http_response_code(503);
+    echo <<<HTML
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Driver Database</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; padding: 20px; background: #f5f5f5; }
+            .container { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            h1 { margin: 0 0 20px; color: #333; }
+            p { margin: 10px 0; }
+            pre { background: #f4f4f4; padding: 10px; border-radius: 4px; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+            button { padding: 8px 20px; background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+            .error { background: #f8d7da; color: #721c24; padding: 10px 14px; border-radius: 4px; margin: 15px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Driver Database</h1>
+            <p>The database <code>{$path}</code> does not exist yet. It is created by <code>windrvscan.py</code>,
+               either empty or by the first scan, for example of the boot.wim:</p>
+            <pre>{$init}</pre>
+            <pre>{$scan}</pre>
+            <p>The web server user needs write access to the database directory to create it from here
+               (see README.md).</p>
+            {$failure}
+            <form method="POST" action="index.php?action=init"><button type="submit">Create empty database</button></form>
+        </div>
+    </body>
+    </html>
+    HTML;
+    exit;
 } catch (Exception $e) {
     die("Database connection failed: " . $e->getMessage());
 }
@@ -30,6 +79,7 @@ $rank_params = [];
 // a full PCI device id (as shown by the device manager) is expanded to the ids Windows matches,
 // otherwise the search is a fragment of the hardware id (e.g. DEV_1533)
 $device = $hwid_search !== '' ? parsePciDeviceId($hwid_search) : null;
+$device_ids = [];
 if ($device) {
     $device_ids = array_column(pciDeviceIds($device['ven'], $device['dev'], $device['subven'], $device['subsys'], $device['rev'], $device['class']), 0);
     $conditions[] = "target.hwid IN (" . implode(',', array_fill(0, count($device_ids), '?')) . ")";
@@ -61,9 +111,8 @@ $total_pages = ceil($total_results / $per_page);
 // Build main query with pagination
 $sql = "SELECT
     MIN(target.id) AS id,
-    MIN(target.name) AS name,
-    MIN(target.hwid) AS hwid,
-    COUNT(*) AS matched,
+    -- all (matching) ids of the row: hwid, kind and name separated by tabs, one per line
+    GROUP_CONCAT(target.hwid || char(9) || target.kind || char(9) || IFNULL(target.name, ''), char(10)) AS ids,
     SUM(target.kind = 'hardware') AS hardware,
     target.arch,
     target.fileset,
@@ -83,6 +132,32 @@ ORDER BY rank, date DESC, driver.id DESC LIMIT ? OFFSET ?";
 $stmt = $db->prepare($sql);
 $stmt->execute(array_merge($rank_params, $params, [$per_page, $offset]));
 $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// device ids of a row, without duplicates (an id can be listed for several target OS versions):
+// the best match of a searched device id first, then hardware before compatible ids
+function row_ids(array $row, array $device_ids): array
+{
+    $ids = [];
+    foreach (explode("\n", $row['ids']) as $line) {
+        [$hwid, $kind, $name] = array_pad(explode("\t", $line, 3), 3, '');
+        $key = strtoupper($hwid);
+        if (!isset($ids[$key]) || $kind === 'hardware') {
+            $ids[$key] = ['hwid' => $hwid, 'kind' => $kind, 'name' => $name];
+        }
+    }
+    $rank = array_flip(array_map('strtoupper', $device_ids));
+    uasort($ids, fn($a, $b) =>
+        [$rank[strtoupper($a['hwid'])] ?? PHP_INT_MAX, $a['kind'] !== 'hardware', $a['hwid']]
+        <=> [$rank[strtoupper($b['hwid'])] ?? PHP_INT_MAX, $b['kind'] !== 'hardware', $b['hwid']]);
+    return array_values($ids);
+}
+
+// expanded lists are limited, GPU drivers have thousands of ids with the same files
+const MAX_LISTED_IDS = 200;
+
+// tooltip of the "compatible" badge
+const COMPATIBLE_ID_TITLE = "Compatible ID: the INF lists this id after the hardware id of a device entry (or without a hardware id). "
+    . "A compatible id matches a whole family of devices, Windows prefers drivers that match a hardware id of the device.";
 
 function format_size(?int $bytes): string
 {
@@ -222,6 +297,40 @@ function format_size(?int $bytes): string
             cursor: pointer;
         }
 
+        details.more {
+            margin-top: 4px;
+        }
+
+        details.more summary {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            background: #e9ecef;
+            color: #555;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        details.more ul {
+            list-style: none;
+            margin-top: 6px;
+            max-height: 300px;
+            overflow: auto;
+        }
+
+        details.more li {
+            margin: 3px 0;
+            font-size: 13px;
+        }
+
+        .muted {
+            color: #888;
+        }
+
+        .badge[title] {
+            cursor: help;
+        }
+
         .badge {
             display: inline-block;
             padding: 1px 6px;
@@ -290,6 +399,7 @@ function format_size(?int $bytes): string
 <body>
     <div class="container">
         <h1>Driver Database</h1>
+        <p style="margin-bottom: 15px;"><a href="upload.php" class="download-link">Upload drivers</a></p>
 
         <form method="GET" class="filter-form">
             <div class="result-count">
@@ -351,16 +461,34 @@ function format_size(?int $bytes): string
                     <?php else: ?>
                         <?php foreach ($results as $row): ?>
                             <tr>
+                                <?php
+                                    $ids = row_ids($row, $device_ids);
+                                    $first = $ids[0];
+                                ?>
                                 <td>
-                                    <?php echo htmlspecialchars($row['name'] ?? ''); ?>
+                                    <?php echo htmlspecialchars($first['name']); ?>
                                 </td>
                                 <td>
-                                    <span class="code"><?php echo htmlspecialchars($row['hwid']); ?></span>
-                                    <?php if ($row['matched'] > 1): ?>
-                                        <span class="badge" title="targets with the same files">+<?php echo $row['matched'] - 1; ?> more</span>
+                                    <span class="code"><?php echo htmlspecialchars($first['hwid']); ?></span>
+                                    <?php if (count($ids) > 1): ?>
+                                        <details class="more">
+                                            <summary title="device ids with the same driver files">+<?php echo count($ids) - 1; ?> more</summary>
+                                            <ul>
+                                                <?php foreach (array_slice($ids, 1, MAX_LISTED_IDS) as $id): ?>
+                                                    <li>
+                                                        <span class="code"><?php echo htmlspecialchars($id['hwid']); ?></span>
+                                                        <?php if ($id['kind'] !== 'hardware'): ?><span class="badge" title="<?php echo htmlspecialchars(COMPATIBLE_ID_TITLE); ?>">compatible</span><?php endif; ?>
+                                                        <?php if ($id['name'] !== $first['name']): ?><span class="muted"><?php echo htmlspecialchars($id['name']); ?></span><?php endif; ?>
+                                                    </li>
+                                                <?php endforeach; ?>
+                                                <?php if (count($ids) - 1 > MAX_LISTED_IDS): ?>
+                                                    <li class="muted">... and <?php echo count($ids) - 1 - MAX_LISTED_IDS; ?> more, search to narrow the list</li>
+                                                <?php endif; ?>
+                                            </ul>
+                                        </details>
                                     <?php endif; ?>
                                     <?php if (!$row['hardware']): ?>
-                                        <span class="badge" title="only matched as compatible id">compatible</span>
+                                        <span class="badge" title="<?php echo htmlspecialchars("All ids of this row are compatible ids. " . COMPATIBLE_ID_TITLE); ?>">compatible</span>
                                     <?php endif; ?>
                                 </td>
                                 <td>

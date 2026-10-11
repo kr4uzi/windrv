@@ -1,9 +1,126 @@
 <?php
 // windrv matching logic, shared by api.php and index.php
 
+class WindrvDatabaseMissing extends RuntimeException
+{
+}
+
+/**
+ * Device setup classes (Class= of the [Version] section) with their device category:
+ * https://learn.microsoft.com/windows-hardware/drivers/install/system-defined-device-setup-classes-available-to-vendors
+ * https://learn.microsoft.com/windows-hardware/drivers/install/system-defined-device-setup-classes-reserved-for-system-use
+ * Class names are case-insensitive.
+ */
+const WINDRV_DEVICE_CLASSES = [
+    "AudioProcessingObject" => "Audio Processing Objects (APOs)",
+    "Battery" => "Battery Devices",
+    "Biometric" => "Biometric Device",
+    "Bluetooth" => "Bluetooth Devices",
+    "Camera" => "Camera Device",
+    "CDROM" => "CD-ROM Drives",
+    "DiskDrive" => "Disk Drives",
+    "Display" => "Display Adapters",
+    "Extension" => "Extension INF",
+    "FDC" => "Floppy Disk Controllers",
+    "FloppyDisk" => "Floppy Disk Drives",
+    "HDC" => "Hard Disk Controllers",
+    "HIDClass" => "Human Interface Devices (HID)",
+    "Dot4" => "IEEE 1284.4 Devices",
+    "Dot4Print" => "IEEE 1284.4 Print Functions",
+    "61883" => "IEEE 1394 Devices That Support the 61883 Protocol",
+    "AVC" => "IEEE 1394 Devices That Support the AVC Protocol",
+    "SBP2" => "IEEE 1394 Devices That Support the SBP2 Protocol",
+    "1394" => "IEEE 1394 Host Bus Controller",
+    "Image" => "Imaging Device",
+    "Infrared" => "IrDA Devices",
+    "Keyboard" => "Keyboard",
+    "MediumChanger" => "Media Changers",
+    "MTD" => "Memory Technology Driver",
+    "Modem" => "Modem",
+    "Monitor" => "Monitor",
+    "Mouse" => "Mouse",
+    "Multifunction" => "Multifunction Devices",
+    "Media" => "Multimedia",
+    "MultiportSerial" => "Multiport Serial Adapters",
+    "Net" => "Network Adapter",
+    "NetClient" => "Network Client",
+    "NetService" => "Network Service",
+    "NetTrans" => "Network Transport",
+    "SecurityAccelerator" => "PCI SSL Accelerator",
+    "PCMCIA" => "PCMCIA Adapters",
+    "Ports" => "Ports (COM & LPT ports)",
+    "Printer" => "Printers",
+    "PNPPrinters" => "Printers, Bus-specific class drivers",
+    "Processor" => "Processors",
+    "SCSIAdapter" => "SCSI, RAID, and NVMe Controllers",
+    "Securitydevices" => "Security Devices",
+    "Sensor" => "Sensors",
+    "SmartCardReader" => "Smart Card Readers",
+    "SoftwareComponent" => "Software Component",
+    "NvmeDisk" => "Storage Disks",
+    "Volume" => "Storage Volumes",
+    "System" => "System Devices",
+    "TapeDrive" => "Tape Drives",
+    "UCM" => "USB Connector Managers",
+    "USBDevice" => "USB Device",
+    "WCEUSBS" => "Windows CE USB ActiveSync Devices",
+    "WPD" => "Windows Portable Devices (WPD)",
+    // reserved for system use
+    "Adapter" => "Adapter",
+    "APMSupport" => "APM",
+    "Computer" => "Computer",
+    "Decoder" => "Decoders",
+    "1394Debug" => "Host-side IEEE 1394 Kernel Debugger Support",
+    "Enum1394" => "IEEE 1394 IP Network Enumerator",
+    "NoDriver" => "No driver",
+    "LegacyDriver" => "Non-Plug and Play Drivers",
+    "Unknown" => "Other Devices",
+    "PrinterUpgrade" => "Printer Upgrade",
+    "PrintQueue" => "Print Queue",
+    "SoftwareDevice" => "Software Device",
+    "AudioEndpoint" => "Audio Endpoint",
+    "Sound" => "Sound",
+    "VolumeSnapshot" => "Storage Volume Snapshots",
+    "USB" => "USB Bus Devices (hubs and host controllers)",
+];
+
+// database path of config.php, relative paths are relative to this directory
+function windrvDbPath(array $config): string
+{
+    $db = $config["db"];
+    return str_starts_with($db, '/') ? $db : __DIR__ . DIRECTORY_SEPARATOR . $db;
+}
+
+// command line to run windrvscan.py with the python of config.php
+function windrvScanCommand(array $config, array $args): string
+{
+    return implode(' ', array_map('escapeshellarg', array_merge(
+        [$config["python"] ?? "python3", __DIR__ . DIRECTORY_SEPARATOR . "windrvscan.py", "--database=" . windrvDbPath($config)], $args)));
+}
+
+// runs windrvscan.py without a shell, returns [exit code, stdout, stderr]
+function windrvScan(array $config, array $args): array
+{
+    $command = array_merge([$config["python"] ?? "python3", __DIR__ . DIRECTORY_SEPARATOR . "windrvscan.py"], $args);
+    $process = proc_open($command, [1 => ["pipe", "w"], 2 => ["pipe", "w"]], $pipes);
+    if (!is_resource($process)) {
+        return [-1, "", "could not start " . ($config["python"] ?? "python3")];
+    }
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    return [proc_close($process), $stdout, $stderr];
+}
+
+// opens the database read-only; the database is created by windrvscan.py (--init or a scan)
 function windrvOpenDb(array $config): PDO
 {
-    $db = new PDO("sqlite:" . $config["db"], null, null,
+    $path = windrvDbPath($config);
+    if (!is_file($path)) {
+        throw new WindrvDatabaseMissing("database {$path} does not exist, create it with: " . windrvScanCommand($config, ["--init"]));
+    }
+    $db = new PDO("sqlite:" . $path, null, null,
         // Pdo\Sqlite exists since PHP 8.4, the PDO::SQLITE_* constants are deprecated since 8.5
         class_exists('Pdo\Sqlite') ? [Pdo\Sqlite::ATTR_OPEN_FLAGS => Pdo\Sqlite::OPEN_READONLY]
                                    : [PDO::SQLITE_ATTR_OPEN_FLAGS => PDO::SQLITE_OPEN_READONLY]);

@@ -27,9 +27,24 @@ chmod +x windrvscan.py
 
 # make windrv available for pxe
 ln -s /srv/windrv /var/www/html/windrv
+
+# create the (empty) database, or scan a WIM / driver right away (see below)
+./windrvscan.py --database=/srv/windrv/drivers.sqlite3 --init
+```
+
+The web pages open the database read-only and do not create it: until it exists, `index.php` shows the command
+(and offers to run it). Set `python` in `config.php` to the venv (`/srv/windrv/.venv/bin/python`).
+
+The web server (`www-data`) needs read access to the database; for uploads also write access to the database,
+its directory (SQLite journal) and `store/`, e.g. with the owner kept and the group set to `www-data`:
+```sh
+sudo chgrp -R www-data /srv/windrv
+sudo chmod -R g+w /srv/windrv
+sudo find /srv/windrv -type d -exec chmod g+s {} +
 ```
 
 Note: Package folders are stored relative to the database directory if they are inside of it, otherwise as absolute paths.
+`db` in `config.php` is relative to the windrv directory.
 
 # Adding Builtin Drivers from WIMs
 `/srv/windrv/windrvscan.py --database=/srv/windrv/drivers.sqlite3 --class-filter=Net boot.wim`
@@ -40,6 +55,21 @@ Note: Package folders are stored relative to the database directory if they are 
 This will parse the driver.inf file but also copy the driver files required by its targets to `store/<sha256 of the INF>` next to the database (or `--store-dir`), keeping the package layout and storing only the absolute minimum files required. The folder is content addressed: storing the same package again is a no-op and different versions of a driver never overwrite each other.
 
 `--fileset-scope section` (default) assigns each target the files of its install section, `--fileset-scope arch` all files of the driver for the target's architecture.
+
+# Upload
+`upload.php` (linked from the driver database) uploads an extracted driver package folder from the browser
+(drag & drop or folder picker): the folder's file list and the INF files are sent first, `windrvscan.py --plan`
+determines the drivers with their required files (and files referenced by the INF files but missing in the folder).
+The page groups the drivers by device class (Microsoft's setup classes, network adapters pre-selected), then only
+the files of the selected drivers are uploaded and imported with `windrvscan.py --store`. Files are sent in chunks of 4 MB, so the php.ini upload
+limits do not need to be raised for large driver files.
+
+Configuration in `config.php`:
+- `python`: python of the venv with the windrvscan.py requirements (e.g. `/srv/windrv/.venv/bin/python`)
+- `uploads`: directory for uploads in progress (default: the system temp directory), deleted after the import or after a day
+
+The web server user needs write access to the database, its directory (SQLite journal) and `store/`.
+There is no authentication: only expose the upload in a trusted network.
 
 # API
 `api.php` answers JSON and is the only interface to the database for other tools (e.g. the iPXE menu `pxe/win/menu.php`):
