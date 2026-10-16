@@ -4,7 +4,7 @@ In essence, the windrvscan.py parses a .inf file and stores (hardware-id, window
 
 The logic data layout is as follows:
 - driver (sha256 of the INF, container, package root, INF, class, provider, signed, DriverVer)
-- fileset (driver, architecture) with its files: the files a target needs, shared by all targets with the same files
+- fileset (driver, architecture) with its files: all files the INF requires for the architecture (the download of its targets)
 - target (driver, fileset, hardware-id, hardware/compatible, architecture, target OS version, DriverVer)
 
 A driver can be tagged with a container which is done automatically when processing wim files - in this case the container is the wim's guid. The allows a iPXE boot script to only inject a driver not contained by the boot/install wim. Drivers of a container have targets but no files.
@@ -14,15 +14,6 @@ A driver can be tagged with a container which is done automatically when process
 ```sh
 apt install wimtools
 cd /srv && git clone https://github.com/kr4uzi/windrv
-```
-
-If you didn't install to /srv/windrv please adjust the first line of windrvscan.py!
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install packaging
 chmod +x windrvscan.py
 
 # make windrv available for pxe
@@ -33,7 +24,7 @@ ln -s /srv/windrv /var/www/html/windrv
 ```
 
 The web pages open the database read-only and do not create it: until it exists, `index.php` shows the command
-(and offers to run it). Set `python` in `config.php` to the venv (`/srv/windrv/.venv/bin/python`).
+(and offers to run it) with `python` of `config.php` (default `python3`).
 
 The web server (`www-data`) needs read access to the database; for uploads also write access to the database,
 its directory (SQLite journal) and `store/`, e.g. with the owner kept and the group set to `www-data`:
@@ -54,7 +45,13 @@ Note: Package folders are stored relative to the database directory if they are 
 
 This will parse the driver.inf file but also copy the driver files required by its targets to `store/<sha256 of the INF>` next to the database (or `--store-dir`), keeping the package layout and storing only the absolute minimum files required. The folder is content addressed: storing the same package again is a no-op and different versions of a driver never overwrite each other.
 
-`--fileset-scope section` (default) assigns each target the files of its install section, `--fileset-scope arch` all files of the driver for the target's architecture.
+A download (`download.php`, the iPXE injection) contains all files the INF requires for the target's architecture
+(the files of its `CopyFiles` directives, located via `SourceDisksFiles`/`SourceDisksNames`, plus INF and catalog).
+
+**Deviation from the specification:** the [Driver Store](https://learn.microsoft.com/windows-hardware/drivers/install/driver-store)
+documentation requires that "all files referenced by the INF files are present in the driver package" - taken
+literally, the files of all architectures of a multi-architecture INF. Windows itself only requires (and stores) the
+files of the architecture it runs on, so windrvscan's downloads only contain those. 
 
 # Upload
 `upload.php` (linked from the driver database) uploads an extracted driver package folder from the browser
@@ -65,7 +62,7 @@ the files of the selected drivers are uploaded and imported with `windrvscan.py 
 limits do not need to be raised for large driver files.
 
 Configuration in `config.php`:
-- `python`: python of the venv with the windrvscan.py requirements (e.g. `/srv/windrv/.venv/bin/python`)
+- `python`: Python 3 used to run windrvscan.py (default `python3`)
 - `uploads`: directory for uploads in progress (default: the system temp directory), deleted after the import or after a day
 
 The web server user needs write access to the database, its directory (SQLite journal) and `store/`.
@@ -88,6 +85,27 @@ The web UI (`index.php`) searches hardware id fragments (`DEV_1533`) or complete
 
 Scanning a WIM uses image 1 by default (`--wim-image` for e.g. the edition of an install.wim).
 
+# Comparison with Microsoft InfVerif (Windows)
+`infverif-compare.ps1` compares the devices windrvscan finds in INF files (ID, hardware/compatible,
+architecture, minimum OS, install section) with Microsoft's InfVerif (`infverif /info`) and prints the deviations.
+It uses `infverif.exe` next to the script; if there is none, the script downloads the latest WDK NuGet package
+([Microsoft.Windows.WDK.x64](https://www.nuget.org/packages/Microsoft.Windows.WDK.x64), no WDK installation needed)
+and extracts `infverif.exe` from it:
+
+```powershell
+.\infverif-compare.ps1                        # driver store of this Windows
+.\infverif-compare.ps1 -Path C:\drivers\intel    # directory (recursive) or a single INF file
+```
+
+# AI disclaimer
+Large parts of this version 2.0 were written with an Claude. Everything was reviewed by me though.
+
+Achieved with AI:
+ - Full compliance with the Windows INF specification
+ - Side by Side comparison verification with InfVerify.exe
+ - Removal of the dependencies (wininfparser, packaging)
+ - Implementation of a custom, actual inf-specification compliant inf parser
+
 # TODOs
 - Add support for DOS kernel handling (Win98)
 - Investigate `LayoutFile` ([Version], documented for Windows 2000/XP): used by system-supplied INFs instead of
@@ -95,15 +113,6 @@ Scanning a WIM uses image 1 by default (`--wim-image` for e.g. the edition of an
 - Add primitve Driver Support:
   -> Manufacturer section must *not* be present
   -> DefaultInstall.nt{amd64,...} must be present
-- Decide the default of `--fileset-scope` (files of a device's download package):
-  -> `section`: only the files of the device's install section (e.g. netathr10x.inf: 5 of 112 files)
-  -> `arch`: all files of the INF for the architecture (always complete)
-  -> Open question: does importing a package into the driver store (`drvload` in WinPE, `pnputil /add-driver`,
-     `DISM /Add-Driver`, "Browse my computer") require all files the INF references, or only those of the used install section?
-  -> Test: signed vendor network driver whose install sections copy different files, `pnputil /add-driver` of a
-     full, an `arch` and a `section` package on a Windows VM (`pnputil /delete-driver oemNN.inf` in between),
-     then confirm the winner with `drvload` in WinPE
-  -> Afterwards remove the option and keep the working mode; the store folder (`--store`) always holds all files
 
 # References
 ## About model section parsing:

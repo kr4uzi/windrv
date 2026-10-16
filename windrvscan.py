@@ -1,4 +1,4 @@
-#!/srv/windrv/.venv/bin/python
+#!/usr/bin/env python3
 import os
 import shutil
 import subprocess
@@ -13,8 +13,30 @@ import infparser
 import sqlite3
 import sys
 from xml.etree import ElementTree
-from packaging import version as pkgver
 from datetime import date, datetime
+
+
+class DriverVersion:
+    """
+    Version of a DriverVer directive: w.x.y.z, each part 0 to 65534 (validated by the parser).
+    https://learn.microsoft.com/windows-hardware/drivers/install/inf-driverver-directive
+    """
+    release: tuple[int, ...]
+
+    def __init__(self, text: str):
+        self.release = tuple(int(part) for part in text.split('.'))
+
+    def __str__(self) -> str:
+        return '.'.join(str(part) for part in self.release)
+
+    def __repr__(self) -> str:
+        return f"DriverVersion('{self}')"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, DriverVersion) and self.release == other.release
+
+    def __hash__(self) -> int:
+        return hash(self.release)
 
 
 ARCHITECTURES = ("x86", "ia64", "amd64", "arm", "arm64")
@@ -188,7 +210,7 @@ class DriverTarget:
     Kind: str
     DeviceDescription: str
     date: date | None
-    version: pkgver.Version | None
+    version: DriverVersion | None
     Architecture: str | None
     OSMajorVersion: int | None
     OSMinorVersion: int | None
@@ -202,7 +224,7 @@ class DriverTarget:
     # files of the driver package required by this target (including the INF)
     files: set[pathlib.Path]
 
-    def __init__(self, hardwareID: str, deviceDescription: str, date: date | None, version: pkgver.Version | None, files: set[pathlib.Path]):
+    def __init__(self, hardwareID: str, deviceDescription: str, date: date | None, version: DriverVersion | None, files: set[pathlib.Path]):
         self.HardwareID = hardwareID
         self.Kind = "hardware"
         self.DeviceDescription = deviceDescription
@@ -221,7 +243,7 @@ class DriverFile:
     sha256: str
     infPath: pathlib.Path
     rootPath: pathlib.Path
-    version: pkgver.Version | None
+    version: DriverVersion | None
     date: date | None
     targets: list[DriverTarget]
     # every Models section listed in [Manufacturer], also empty or missing ones (they exclude a target OS)
@@ -253,6 +275,8 @@ class DriverFile:
     manifest: Manifest | None
     # files referenced by the INF that are not part of the driver package (INF directory + relative path)
     missing: set[pathlib.Path]
+    # device ids dropped by ExcludeID: (id, kind, models decoration, install section)
+    excluded: list[tuple[str, str, "ModelsDecoration", str]]
     # key to value mapping for string replacement (e.g. %strkey% in the model section)
     strings: dict[str, str]
 
@@ -279,6 +303,7 @@ class DriverFile:
         self.wim = data is not None
         self.manifest = manifest
         self.missing = set()
+        self.excluded = []
         self.visited = visited if visited is not None else set()
         self.visited.add(str(self.infPath.resolve()) if not self.wim else path)
         self.copyInfs = {}
@@ -649,11 +674,12 @@ class DriverFile:
             return
 
         # device-description=install-section-name[,hw-id][,compatible-id...]
-        # The description belongs to the model entry, i.e. to the pair of install
-        # section and device id. The same id may be listed by several entries;
-        # Windows treats each entry as a separate driver candidate, so every
-        # (id, install section) pair becomes its own target.
-        deviceSections: dict[tuple[str, str], tuple[str, str]] = {}
+        # The description belongs to the model entry, i.e. to the install section and
+        # device id. The same id may be listed by several entries; Windows treats each
+        # entry as a separate driver candidate, so every (id, install section, kind) is
+        # its own target: an id can be the hardware id of one entry and a compatible id
+        # of another entry of the same install section (like InfVerif lists them).
+        deviceSections: dict[tuple[str, str, str], str] = {}
         for entry in self.inf.entries(modelSection):
             if entry.key is None or not entry.values or not entry.values[0]:
                 print(f"warning: models entry without install section in [{modelSection}] (line {entry.line})")
@@ -677,16 +703,14 @@ class DriverFile:
                 if not id: continue
                 # the first id is the hardware id, the following ones are compatible ids
                 kind = "hardware" if index == 0 else "compatible"
-                existing = deviceSections.get((id, installSection))
-                if existing:
-                    if existing[0] != deviceDescription:
-                        print(f"warning: {id} listed multiple times for {installSection} in [{modelSection}] (line {entry.line}), keeping the first description")
-                    if kind == "hardware" and existing[1] != kind:
-                        deviceSections[(id, installSection)] = (existing[0], kind)
+                existing = deviceSections.get((id, installSection, kind))
+                if existing is not None:
+                    if existing != deviceDescription:
+                        print(f"warning: {id} listed multiple times as {kind} id for {installSection} in [{modelSection}] (line {entry.line}), keeping the first description")
                     continue
-                deviceSections[(id, installSection)] = (deviceDescription, kind)
+                deviceSections[(id, installSection, kind)] = deviceDescription
 
-        for (hardwareId, installSection), (name, kind) in deviceSections.items():
+        for (hardwareId, installSection, kind), name in deviceSections.items():
             # install-section-name.nt<arch> -> install-section-name.nt -> install-section-name
             ddinstall = self.inf.resolveDecorated(installSection, arch)
             if ddinstall is None:
@@ -696,6 +720,7 @@ class DriverFile:
             # (only processed when specified directly in the DDInstall section)
             excluded = {v.upper() for key, _, entry in self.sections[ddinstall] if key == "excludeid" for v in entry.values if v}
             if hardwareId in excluded:
+                self.excluded.append((hardwareId, kind, models, ddinstall))
                 continue
 
             sections: set[str] = {ddinstall}
@@ -820,7 +845,7 @@ class DriverFile:
             self.date, self.version = self._parseDriverVer(driverVer)
 
 
-    def _parseDriverVer(self, entry: infparser.Entry) -> tuple[date | None, pkgver.Version | None]:
+    def _parseDriverVer(self, entry: infparser.Entry) -> tuple[date | None, DriverVersion | None]:
         # https://learn.microsoft.com/windows-hardware/drivers/install/inf-driverver-directive
         # DriverVer=mm/dd/yyyy[,w.x.y.z]; a hyphen can be used as the date separator,
         # an invalid date is treated as 00/00/0000
@@ -845,7 +870,7 @@ class DriverFile:
             elif all(int(p) == 0 for p in parts):
                 print(f"error: invalid DriverVer version {versionValue}, 0.0.0.0 is not valid (line {entry.line})")
             else:
-                driverVersion = pkgver.Version(versionValue)
+                driverVersion = DriverVersion(versionValue)
 
         return driverDate, driverVersion
 
@@ -961,7 +986,7 @@ SCHEMA = """
 """
 
 
-def versionParts(version: pkgver.Version | None) -> tuple[int | None, int | None, int | None, int | None]:
+def versionParts(version: DriverVersion | None) -> tuple[int | None, int | None, int | None, int | None]:
     # DriverVer versions have four parts (w.x.y.z), missing parts are 0
     if version is None:
         return (None, None, None, None)
@@ -1136,6 +1161,36 @@ def storePackage(driver: DriverFile, files: set[str], storeDir: pathlib.Path) ->
     return destination
 
 
+def deviceKey(hwid: str, kind: str, models: ModelsDecoration, installSection: str) -> str:
+    """
+    A device of an INF as "ID|kind|arch|minimum OS|install section", the fields of 'infverif /info'
+    (minimum OS: major.minor[.build] of the TargetOSVersion decoration, empty without version).
+    """
+    minimumOS = ""
+    if models.osMajor is not None:
+        minimumOS = f"{models.osMajor}.{models.osMinor or 0}" + (f".{models.build}" if models.build else "")
+    return f"{hwid.upper()}|{kind}|{models.arch}|{minimumOS}|{installSection.lower()}"
+
+
+def listDevices(infs: list[str]) -> dict:
+    """Devices and ExcludeID-excluded ids per INF (used by infverif-compare.ps1)."""
+    result = {}
+    for path in infs:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                driver = DriverFile(path)
+                if driver.valid:
+                    driver.parseDevices()
+        except Exception as e:
+            result[path] = {"error": f"{type(e).__name__}: {e}"}
+            continue
+        result[path] = {
+            "devices": sorted({deviceKey(t.HardwareID, t.Kind, t.Models, t.InstallSection) for t in driver.targets}),
+            "excluded": sorted({deviceKey(*e) for e in driver.excluded}),
+        }
+    return result
+
+
 def planUpload(infs: list[str], manifest: Manifest, classFilter: set[str] | None) -> dict:
     """
     Which files of an upload are required: the INF files are available locally, all other files are
@@ -1195,7 +1250,7 @@ def planUpload(infs: list[str], manifest: Manifest, classFilter: set[str] | None
     }
 
 
-def importDriver(db: DriverDatabase, driver: DriverFile, container: str, wim: bool, store: pathlib.Path | None, filesetScope: str):
+def importDriver(db: DriverDatabase, driver: DriverFile, container: str, wim: bool, store: pathlib.Path | None):
     dbDir = pathlib.Path(db.db_path).absolute().parent
 
     # files of each target relative to the package root (the INF directory)
@@ -1223,22 +1278,23 @@ def importDriver(db: DriverDatabase, driver: DriverFile, container: str, wim: bo
 
         modelsIds = {id(models): db.addModels(driverId, models) for models in driver.models}
 
-        # file sets are shared by all targets with the same files (per architecture)
-        filesets: dict[tuple[str, frozenset[str]], int | None] = {}
-        if filesetScope == "arch":
-            union: dict[str, set[str]] = {}
-            for index, t in enumerate(driver.targets):
-                union.setdefault(t.Architecture or "", set()).update(targetFiles.get(index, ()))
-            targetFiles = {index: frozenset(union[t.Architecture or ""]) for index, t in enumerate(driver.targets)} if not wim else {}
-
+        # one file set per architecture: all files the INF requires for it. Importing a driver
+        # package into the driver store (drvload, pnputil, DISM) fails if a file of another
+        # install section of the same architecture is missing ("The system cannot find the file
+        # specified"), so the files of a single install section are not enough.
+        archFiles: dict[str, set[str]] = {}
         for index, t in enumerate(driver.targets):
+            archFiles.setdefault(t.Architecture or "", set()).update(targetFiles.get(index, ()))
+        filesets: dict[str, int | None] = {}
+
+        for t in driver.targets:
             filesetId = None
-            if index in targetFiles:
-                key = (t.Architecture or "", targetFiles[index])
-                if key not in filesets:
-                    sizes = [(f, root.joinpath(f).stat().st_size if root.joinpath(f).is_file() else None) for f in sorted(key[1])]
-                    filesets[key] = db.addFileset(driverId, key[0], sizes)
-                filesetId = filesets[key]
+            arch = t.Architecture or ""
+            if not wim:
+                if arch not in filesets:
+                    sizes = [(f, root.joinpath(f).stat().st_size if root.joinpath(f).is_file() else None) for f in sorted(archFiles[arch])]
+                    filesets[arch] = db.addFileset(driverId, arch, sizes)
+                filesetId = filesets[arch]
             modelsId = modelsIds[id(t.Models)]
             if modelsId is None:
                 raise RuntimeError(f"failed to add models section {t.Models.sectionName()}")
@@ -1274,13 +1330,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--fileset-scope",
-        choices=["section", "arch"],
-        default="section",
-        help="files of a target: those of its install section, or all files of the driver for the architecture (default: %(default)s)"
-    )
-
-    parser.add_argument(
         "--wim-image",
         type=int,
         default=1,
@@ -1291,6 +1340,12 @@ if __name__ == "__main__":
         "--class-filter",
         help="only add drivers for the given class (e.g. Net, Display, Bluetooth)",
         nargs="+"
+    )
+
+    parser.add_argument(
+        "--devices",
+        action="store_true",
+        help="print the devices of the INF files as JSON (no database changes), see infverif-compare.ps1"
     )
 
     parser.add_argument(
@@ -1356,7 +1411,11 @@ if __name__ == "__main__":
         # is to check if driver for a device is built-in and not to download those
         # files (also, drivers are not stored in /Windows/INF but in
         # /Windows/System32/DriverStore which requires a different parsing strategy)
-        importDriver(db, driver, container, data is not None, storeDir, args.fileset_scope)
+        importDriver(db, driver, container, data is not None, storeDir)
+
+    if args.devices:
+        print(json.dumps(listDevices(args.files), indent=1))
+        sys.exit(0)
 
     if args.plan:
         if not args.manifest:

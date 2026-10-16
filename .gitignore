@@ -2,3 +2,4 @@
 .venv
 drivers.sqlite3
 __pycache__/
+/infverif.exe

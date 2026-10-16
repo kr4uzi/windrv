@@ -320,7 +320,9 @@ function windrvBest(array $targets, array $idRank): ?array
 {
     usort($targets, function ($a, $b) use ($idRank) {
         $version = fn($t) => [$t['date'] ?? '', (int)$t['v_major'], (int)$t['v_minor'], (int)$t['v_patch'], (int)$t['v_build']];
-        return [$idRank[strtoupper($a['hwid'])], -(int)$a['signed']] <=> [$idRank[strtoupper($b['hwid'])], -(int)$b['signed']]
+        // the same id can be the hardware id of one entry and a compatible id of another
+        return [$idRank[strtoupper($a['hwid'])], $a['kind'] !== 'hardware', -(int)$a['signed']]
+            <=> [$idRank[strtoupper($b['hwid'])], $b['kind'] !== 'hardware', -(int)$b['signed']]
             ?: $version($b) <=> $version($a);
     });
     return $targets[0] ?? null;
